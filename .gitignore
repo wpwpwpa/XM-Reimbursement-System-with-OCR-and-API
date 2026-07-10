@@ -1,0 +1,35 @@
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.idea/
+.vscode/
+*.egg-info/
+.DS_Store
+Thumbs.db
+
+logs/
+.workbuddy/
+config.json
+
+models/
+*.gguf
+*.bin
+*.onnx
+
+# PyInstaller artifacts
+*.pkg
+*.toc
+*.pyz
+*.html
+*.txt
+base_library.zip
+warn-*.txt
+xref-*.html
+
+# Compiled binaries
+*.exe
+*.dll
+*.pyd

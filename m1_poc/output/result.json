@@ -1,0 +1,26 @@
+[
+  {
+    "original_name": "meituan.png",
+    "amount": 14.6,
+    "platform": "美团",
+    "confidence": 1.0,
+    "status": "success",
+    "_raw_text": "美团闪购\n订单详情\n实付\n￥14.6\n闪购专送"
+  },
+  {
+    "original_name": "pinduoduo.png",
+    "amount": 14.1,
+    "platform": "拼多多",
+    "confidence": 1.0,
+    "status": "success",
+    "_raw_text": "拼小圈\n已拼单2件\n合计\n￥14.1"
+  },
+  {
+    "original_name": "taobao.png",
+    "amount": 26.52,
+    "platform": "淘宝",
+    "confidence": 1.0,
+    "status": "success",
+    "_raw_text": "天猫超市\n订单号：123456789\n实付款￥26.52\n企业购专享价"
+  }
+]

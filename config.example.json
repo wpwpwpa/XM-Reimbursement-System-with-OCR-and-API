@@ -1,0 +1,39 @@
+{
+  "last_folder": "",
+  "settings": {
+    "template": "{price}{platform}{ext}",
+    "conflict": "追加序号 (1)(2)...",
+    "threshold": 0.7,
+    "fail": "跳过并记录日志",
+    "types": ".jpg .jpeg .png .pdf",
+    "invoice_category": "发票",
+    "auto_rename": false,
+    "log_dir": "./logs",
+    "taobao_excel": ""
+  },
+  "model": {
+    "mode": "OCR+正则",
+    "text_backend": "本地",
+    "vis_backend": "本地",
+    "ocr_local": {
+      "endpoint": "http://localhost:1234",
+      "model": "qwen2.5-1.5b-instruct.gguf"
+    },
+    "ocr_cloud": {
+      "endpoint": "",
+      "api_key": "",
+      "model": ""
+    },
+    "vision_local": {
+      "endpoint": "http://127.0.0.1:1234",
+      "model": "qwen2.5-vl-7b-instruct"
+    },
+    "vision_cloud": {
+      "endpoint": "",
+      "api_key": "",
+      "model": ""
+    },
+    "ocr_prompt": "",
+    "vision_prompt": ""
+  }
+}

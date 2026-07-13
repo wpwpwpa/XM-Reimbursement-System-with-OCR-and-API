@@ -78,15 +78,25 @@ def build_reimbursement_rows(results, files) -> list[dict]:
         order_time = parsed.get("order_time")
         if amount is None or not order_time:
             continue  # 缺必填项，跳过（无法导入）
+        # 图片需商品名齐全；发票商品名为税目分类，不强制
+        if parsed.get("kind") != "invoice" and not parsed.get("product_name"):
+            continue  # 图片缺商品名 → 跳过不导出
+        # 发票行：消费事由不填开票公司名，用固定「平台」占位
+        if parsed.get("kind") == "invoice":
+            plat = "平台"
+        else:
+            plat = parsed.get("platform") or ""
         rows.append({
             "金额": amount,
             "消费日期": order_time,
             "发票形式": "",                       # 按需求留空
             "发票": invoice_count(parsed),
             "消费事由": _build_reason(
-                order_time, parsed.get("platform") or "",
+                order_time, plat,
                 parsed.get("product_name"), amount),
         })
+    # 按消费日期升序（旧→新）导出
+    rows.sort(key=lambda r: r["消费日期"])
     return rows
 
 

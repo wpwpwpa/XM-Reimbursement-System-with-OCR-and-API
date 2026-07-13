@@ -53,6 +53,19 @@ def recognize_one(backend, image_path, threshold: float = DEFAULT_THRESHOLD,
                                  threshold=threshold)
 
 
+def _require_product_for_images(result: dict) -> None:
+    """图片四要素（金额/平台/日期/商品名）齐全才算成功。
+
+    发票（kind=invoice）商品名是税目分类、非真实商品名，不适用此规则。
+    仅对当前 success 的图片降级：缺商品名 → failed + 原因标注。
+    """
+    if result.get("kind") == "invoice":
+        return
+    if result.get("status") == "success" and not result.get("product_name"):
+        result["status"] = "failed"
+        result["reason"] = (result.get("reason") or "") + "（缺少商品名称）"
+
+
 def _need_model(result: dict) -> bool:
     """门控判定：正则前置结果是否还需要调模型兜底。
 
@@ -109,6 +122,7 @@ def recognize_image_gated(backend, image_path, model_fn=None,
     #       其余（非拼多多/美团 或 纯正则档）走原 _need_model。
     always_run = platform in ("拼多多", "美团") and model_fn is not None
     if model_fn is None or (not always_run and not _need_model(result)):
+        _require_product_for_images(result)
         return result
 
     # 直接调模型判断（方案A：一次调用，采用模型商品名，不对比不仲裁）
@@ -132,6 +146,27 @@ def recognize_image_gated(backend, image_path, model_fn=None,
             lt = normalize_date(mres.get("order_time"))
             if lt:
                 result["order_time"] = lt
+
+    # 后处理：模型未给 platform 或 product_name 时，用 OCR 文本正则再兜底一次。
+    # 这样本地小模型即使只给出 amount，也能配合正则完成识别。
+    platform = result.get("platform")
+    if not platform:
+        from m1_poc.parser import detect_platform
+        _detected = detect_platform(text)
+        if _detected:
+            result["platform"] = _detected
+            platform = _detected
+    if platform in ("拼多多", "美团") and not result.get("product_name"):
+        _prod = extract_product_name(text, platform)
+        if _prod and not _is_bad_product(_prod):
+            result["product_name"] = _prod
+        # 同时补时间（若模型/正则此前都未给出）
+        if not result.get("order_time"):
+            _ot = extract_order_time(text, platform)
+            if _ot:
+                result["order_time"] = _ot
+
+    if mres or result.get("amount") is not None:
         # 补缺后重算置信度/状态
         result["confidence"] = synthesize_confidence(
             result.get("amount"), result.get("platform"),
@@ -139,8 +174,11 @@ def recognize_image_gated(backend, image_path, model_fn=None,
         result["status"] = (
             "success" if result["confidence"] >= threshold else "failed"
         )
-        result["used_model"] = True
-        result["reason"] = (result.get("reason") or "") + "（模型兜底补缺）"
+        if mres:
+            result["used_model"] = True
+            result["reason"] = (result.get("reason") or "") + "（模型兜底补缺）"
+
+    _require_product_for_images(result)
     return result
 
 

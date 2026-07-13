@@ -286,4 +286,32 @@ def extract_product_name(text: str, platform: str | None) -> str | None:
         return by_label
 
     # 2) 金额锚点兜底
-    return _extract_by_price_anchor(lines, platform)
+    by_anchor = _extract_by_price_anchor(lines, platform)
+    if by_anchor:
+        return by_anchor
+
+    # 3) 含「约」生鲜重量估算兜底（美团多商品订单，商品名常在子实付下方）
+    by_yue = _extract_by_yue(lines)
+    if by_yue:
+        return by_yue
+
+    return None
+
+
+def _extract_by_yue(lines) -> str | None:
+    """含『约』的生鲜重量估算行常是美团商品名（如『瘦肉约100g』『大蒜头1个约25克』）。
+
+    仅作标签/锚点都失败后的兜底。带护栏：排除配送/营销文案
+    （约X分钟送达、约省X元、预计约X），避免误抓成商品名。
+    """
+    for ln in lines:
+        if "约" not in ln:
+            continue
+        if _line_is_noise(ln):
+            continue
+        if not _looks_like_product(ln):
+            continue
+        if any(k in ln for k in ("送达", "分钟", "小时", "省", "预计")):
+            continue
+        return _strip_spec(ln)
+    return None

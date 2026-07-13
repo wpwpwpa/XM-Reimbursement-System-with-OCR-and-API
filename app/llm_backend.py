@@ -21,7 +21,11 @@ from order_fields import normalize_date
 _OCR_PROMPT = (
     "你是订单商品提取助手。从订单 OCR 文本中提取信息，只返回 JSON：\n"
     "1. amount：实付金额（最终付款数字）\n"
-    "2. platform：平台名称（拼小圈/拼多多→拼多多，闪购/美团→美团，天猫/淘宝/企→淘宝，其他→null）\n"
+    "2. platform：平台名称，按以下特征词严格判定（看到即判，不要猜测）：\n"
+    "   - 出现「拼小圈」「拼单时间」「成交时间」「先用后付」→ 拼多多\n"
+    "   - 出现「闪购」→ 美团\n"
+    "   - 出现「天猫」「淘宝」「企」「交易快照」→ 淘宝\n"
+    "   - 都不匹配 → null\n"
     "3. order_time：下单时间（拼多多取「下单时间」字段、美团取「期望时间」字段；格式 YYYY-MM-DD 或 M月D日；淘宝填 null）\n"
     "4. product_name：商品完整名称（严格遵守以下剥离规则）\n"
     "\n"
@@ -106,7 +110,7 @@ class OpenAICompatibleBackend(LLMBackend):
 
         req = urllib.request.Request(url, data=payload, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             return {
@@ -115,7 +119,12 @@ class OpenAICompatibleBackend(LLMBackend):
             }
 
         content = data.get("choices", [{}])[0].get("message", {})
-        raw_content = content.get("content", "")
+        raw_content = content.get("content") or ""
+        # 推理模型（如 qwen3 系列）最终答案在 reasoning_content，content 为空
+        if not raw_content:
+            raw_content = content.get("reasoning_content") or ""
+
+        # 1) JSON 路径（首选）
         try:
             result = _extract_json(raw_content)
             if not result:
@@ -238,9 +247,9 @@ _VISION_PROMPT = (
     "你是订单商品提取助手。请观察图片，严格提取以下信息，只返回 JSON：\n"
     "1. amount：实付金额（数字，取最终付款金额，如 26.52）\n"
     "2. platform：购物平台，严格按特征词判定（看到即判，不要凭界面风格猜测）：\n"
-    "   - 截图出现「拼小圈」→ 拼多多\n"
+    "   - 截图出现「拼小圈」「拼单时间」「成交时间」「先用后付」→ 拼多多\n"
     "   - 截图出现「闪购」→ 美团\n"
-    "   - 截图出现「天猫」「淘宝」或「企」（如淘宝企业购）→ 淘宝\n"
+    "   - 截图出现「天猫」「淘宝」「企」「交易快照」→ 淘宝\n"
     "   - 以上都不匹配 → null（不要猜测其他平台）\n"
     "3. order_time：下单时间（拼多多取「下单时间」、美团取「期望时间」；格式 YYYY-MM-DD 或 M月D日；淘宝填 null）\n"
     "4. product_name：商品完整名称（严格遵守以下剥离规则）\n"
@@ -260,15 +269,43 @@ _VISION_PROMPT = (
 
 
 def _extract_json(content: str) -> dict:
-    """容错提取 JSON：取第一个 { 到最后一个 } 之间的内容。"""
-    try:
-        s = content.strip()
-        start = s.find("{")
-        end = s.rfind("}")
-        if start != -1 and end != -1 and end > start:
+    """容错提取 JSON。
+
+    兼容四种来源：
+    1. 纯 JSON 字符串
+    2. ```json ... ``` / ``` ... ``` 代码块
+    3. 推理模型思维链（reasoning_content）：从后往前找最后一个合法 {..}
+    4. 兜底：第一个 { 到最后一个 } 之间
+    """
+    if not content:
+        return {}
+    s = content.strip()
+    # 1) fenced code block
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # 2) 从后往前找最后一个合法 JSON 对象（兼容推理模型 reasoning_content）
+    last = s.rfind("}")
+    while last != -1:
+        first = s.rfind("{", 0, last)
+        if first == -1:
+            break
+        cand = s[first:last + 1]
+        try:
+            return json.loads(cand)
+        except Exception:
+            last = s.rfind("}", 0, first)
+    # 3) 兜底传统策略
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
             return json.loads(s[start:end + 1])
-    except Exception:
-        pass
+        except Exception:
+            pass
     return {}
 
 
@@ -358,7 +395,7 @@ class VisionBackend:
     """
 
     def __init__(self, endpoint: str, model: str, api_key: str = "",
-                 timeout: int = 60, prompt: str | None = None):
+                 timeout: int = 300, prompt: str | None = None):
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -413,8 +450,22 @@ class VisionBackend:
         except Exception as e:
             return _vision_fail(f"视觉请求失败: {e}")
 
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return _normalize_vision(_extract_json(content))
+        msg = data.get("choices", [{}])[0].get("message", {})
+        content = msg.get("content") or ""
+        # 推理模型（如 qwen3 系列）最终答案写在 reasoning_content，content 为空
+        if not content:
+            content = msg.get("reasoning_content") or ""
+
+        json_result = _extract_json(content)
+        if json_result:
+            return _normalize_vision(json_result)
+
+        return _vision_fail(
+            f"视觉模型返回内容无法解析为结构化数据 "
+            f"(content={'空' if not msg.get('content') else '有值'}, "
+            f"reasoning_content={'有值' if msg.get('reasoning_content') else '无'}, "
+            f"文本长度={len(content)})"
+        )
 
     def _test_url(self) -> str:
         """根据端点生成测试连接 URL（与 OpenAICompatibleBackend 逻辑一致）。"""

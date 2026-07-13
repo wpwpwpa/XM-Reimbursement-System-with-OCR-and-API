@@ -12,6 +12,7 @@
 返回 dict 与图片识别同构，并额外带 `kind="invoice"` 供 GUI 分流。
 """
 import re
+from pathlib import Path
 
 # 价格数字（含千分位逗号、2 位小数）：如 735.00 / 1,240.00
 _AMOUNT_RE = re.compile(r"[0-9][0-9,]*\.\d{2}")
@@ -72,35 +73,77 @@ def _extract_amount(text: str) -> float | None:
     return None
 
 
+def _find_title(words: list, target: str):
+    """在 words 中查找标题词（兼容竖排拆字，如 '销'/'售'/'方' 分散成多词）。
+
+    返回命中的代表 word（取标题首字所在 word），未找到返回 None。
+    """
+    # 1) 完整/包含匹配（横排，如淘宝）
+    for w in words:
+        if target in w[4].replace(" ", ""):
+            return w
+    # 2) 竖排：同列（x 接近）单字按 y 递增拼接，看是否含 target（如京东）
+    singles = [
+        w for w in words
+        if len(w[4].replace(" ", "")) == 1
+        and w[4].strip() not in ("：", ":", "）", ")", "（", "(")
+    ]
+    cols: dict[float, list] = {}
+    for w in singles:
+        cx = round((w[0] + w[2]) / 2 / 8) * 8  # 列量化
+        cols.setdefault(cx, []).append(w)
+    for col in cols.values():
+        col.sort(key=lambda w: w[1])
+        phrase = "".join(w[4].replace(" ", "") for w in col)
+        if target in phrase:
+            return col[phrase.find(target)]
+    return None
+
+
 def _extract_parties(words: list) -> tuple[str | None, str | None]:
     """用坐标法区分销售方 / 购买方名称。
 
-    返回 (seller, buyer)。「名称」标签右侧同行文本即公司名；
-    归属判定：与「销售方」「购买方」标题词的 (y,x) 距离，近者归属。
+    返回 (seller, buyer)。
+    - 「名称」标签右侧同行文本即公司名（横排，如淘宝）；
+    - 若为上下布局（标签在上、公司在下，如京东竖排 PDF），取标签同列下方第一行；
+    - 标题词兼容竖排拆字（'销售方' 可能拆成 '销'/'售'/'方'）；
+    - 归属：与「销售方」「购买方」标题词距离近者归属；均无标题时按名称标签 y 顺序（上=销售方）。
     """
-    seller_title = buyer_title = None
-    for w in words:
-        t = w[4].strip()
-        if "销售方" in t and seller_title is None:
-            seller_title = w
-        if "购买方" in t and buyer_title is None:
-            buyer_title = w
+    seller_title = _find_title(words, "销售方")
+    buyer_title = _find_title(words, "购买方")
 
-    # 「名称」标签词：购买方/销售方栏的「名称」或「名称：」。
-    # 精确匹配，排除「项目名称」「货物或应税劳务、服务名称」等明细表头。
-    name_labels = [
-        w for w in words
-        if w[4].strip() in ("名称", "名称：", "名称:", "名称）", "名称)")
-    ]
+    def _is_name_label(t: str) -> bool:
+        norm = t.replace(" ", "")
+        return norm.startswith("名称") and not any(
+            k in norm for k in ("项目", "劳务", "服务", "应税")
+        )
+
+    name_labels = [w for w in words if _is_name_label(w[4].strip())]
+    _SKIP = ("：", ":", "）", ")", "（", "(", "")
 
     seller = buyer = None
     for nw in name_labels:
-        # 右侧同行（y 接近）、在标签之后的词，拼成公司名
+        # 同行右侧（横排）
         right = [
             w for w in words
             if abs(w[1] - nw[1]) <= 4 and w[0] > nw[0] + 1
-            and w[4].strip() not in ("：", ":", "）", ")", "")
+            and w[4].strip() not in _SKIP
         ]
+        if not right:
+            # 同列下方第一行（上下布局，如京东）
+            col_c = (nw[0] + nw[2]) / 2
+            below = [
+                w for w in words
+                if w[1] > nw[3] and abs((w[0] + w[2]) / 2 - col_c) <= 60
+                and w[4].strip() not in _SKIP
+            ]
+            if below:
+                below.sort(key=lambda w: w[1])
+                first_y = below[0][1]
+                right = sorted(
+                    [w for w in below if abs(w[1] - first_y) <= 4],
+                    key=lambda w: w[0],
+                )
         company = "".join(w[4] for w in right).strip(" ：:（）()")
         if not company:
             continue
@@ -117,9 +160,40 @@ def _extract_parties(words: list) -> tuple[str | None, str | None]:
         elif buyer_title:
             buyer = company
         else:
-            # 无标题词：左右布局下右栏多为销售方，兜底归销售方
-            seller = company
+            # 无标题词：按名称标签 y 顺序，上方（先出现）为销售方
+            if seller is None:
+                seller = company
+            elif buyer is None:
+                buyer = company
     return seller, buyer
+
+
+def _extract_seller_by_text(text: str) -> str | None:
+    """坐标法失败时的文本兜底：从销售方区块提取公司名称。
+
+    兼容竖排标签（'销售方'→'销\\n售\\n方'，'名称'→'名 称'），
+    且允许「名称:」与公司名跨行（中间隔信用代码等行）。
+    """
+    # 竖排标签还原
+    norm = re.sub(r"销\s*售\s*方", "销售方", text)
+    norm = re.sub(r"名\s*称", "名称", norm)
+
+    # 1) 销售方区块内「名称」后的公司名（非贪婪跳过中间行，捕获含公司后缀的行）
+    m = re.search(
+        r"销售方.*?名称[:：]\s*((?:[^\n]*\n)*?)([^\n]*(?:有限公司|公司|集团|股份)[^\n]*)",
+        norm, re.DOTALL,
+    )
+    if m:
+        return m.group(2).strip(" ：:（）()")
+
+    # 2) 兜底：全文第一个「名称」后的公司名
+    m2 = re.search(
+        r"名称[:：]\s*((?:[^\n]*\n)*?)([^\n]*(?:有限公司|公司|集团|股份)[^\n]*)",
+        norm, re.DOTALL,
+    )
+    if m2:
+        return m2.group(2).strip(" ：:（）()")
+    return None
 
 
 def _extract_product_name(words: list, text: str) -> str | None:
@@ -197,6 +271,8 @@ def recognize_invoice(pdf_path: str) -> dict:
     amount = _extract_amount(text)
     date = _norm_date(_DATE_CN_RE.search(text), _DATE_DASH_RE.search(text))
     seller, buyer = _extract_parties(words)
+    if not seller:
+        seller = _extract_seller_by_text(text)
 
     m = _INVOICE_NO_RE.search(text)
     invoice_no = m.group(1) if m else None

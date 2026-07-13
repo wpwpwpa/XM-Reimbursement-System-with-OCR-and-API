@@ -7,10 +7,13 @@ import re
 # 平台判定：特征词独立互不覆盖，命中即定，不再向下。
 # 淘宝系订单截图必含 天猫/淘宝/企(企业购)；美团靠 闪购；拼多多靠 拼小圈。
 # 禁用 拼多多驿站(代收驿站非购物平台)、不靠裸词 拼多多(易与快递/驿站混淆)。
+# 补充：
+# - 拼多多特有「拼单时间」「成交时间」「先用后付」
+# - 淘宝常见「交易快照」+「订单编号」组合
 PLATFORM_RULES = [
-    ("淘宝", ["天猫", "淘宝", "企"]),
+    ("淘宝", ["天猫", "淘宝", "企", "交易快照"]),
     ("美团", ["闪购"]),
-    ("拼多多", ["拼小圈"]),
+    ("拼多多", ["拼小圈", "拼单时间", "成交时间", "先用后付"]),
 ]
 
 PLATFORM_WHITELIST = {"淘宝", "美团", "拼多多"}
@@ -32,15 +35,34 @@ def detect_platform(text: str):
     return None
 
 
+_DISCOUNT_RE = re.compile(r"共减|优惠|立减|减|折扣|抵扣")
+
+
 def _match_amount_after(text: str, keywords: list[str]):
-    """在文本中找关键词，取其后的金额(允许关键词与数字跨行≤15字符)。"""
+    """在关键词前后窗口内找金额（OCR 输出顺序可能与阅读顺序不同）。
+
+    跳过被优惠减免词修饰的金额（如「实付款共减￥227.92」中的 227.92 是
+    优惠额，真实付款在下行的 ￥361.79），避免把减免额误当实付款。
+    """
     for kw in keywords:
         idx = text.find(kw)
         while idx != -1:
+            # 优先关键词后方（常规阅读顺序）
             tail = text[idx: idx + len(kw) + 20]
-            m = _AMOUNT_RE.search(tail)
+            found = None
+            for m in _AMOUNT_RE.finditer(tail):      # 遍历窗口内所有金额
+                pre = tail[max(0, m.start(2) - 5): m.start(2)]  # 数字前的修饰词
+                if _DISCOUNT_RE.search(pre):
+                    continue                          # 优惠减免额，跳过
+                found = float(m.group(2))
+                break
+            if found is not None:
+                return found
+            # 后方没有，则向前方窗口兜底（如 ￥295v\n实付款）
+            head = text[max(0, idx - 20): idx + len(kw)]
+            m = _NUM_RE.search(head)
             if m:
-                return float(m.group(2))
+                return float(m.group(1))
             idx = text.find(kw, idx + 1)
     return None
 

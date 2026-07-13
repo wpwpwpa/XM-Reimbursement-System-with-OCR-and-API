@@ -882,7 +882,7 @@ class MainWindow(QMainWindow):
             entry = self._rename_one(r, folder, strategy)
             entry["rerun"] = True
             entries.append(entry)
-            if entry.get("status") == "success" and entry.get("new_name"):
+            if entry.get("new_name"):
                 # _rename_one 已同步 self.files[r]；记录用于撤销（仅实际改名项有）
                 old = entry.get("_old_abs")
                 new = entry.get("_new_abs")
@@ -906,37 +906,30 @@ class MainWindow(QMainWindow):
     def _rename_one(self, i: int, folder: Path, strategy: str) -> dict:
         """按当前设置为单行生成新文件名并立即改名，返回日志 entry。
 
-        与 execute_rename 单行逻辑一致；失败/跳过不动文件。
-        entry 额外带 _old_abs/_new_abs 供调用方入撤销栈（用后自行 pop）。
+        与 execute_rename 单行逻辑一致；金额+平台齐全但缺商品名的失败项
+        仍改名，状态保持失败（_old_abs/_new_abs 供调用方入撤销栈，用后 pop）。
         """
         parsed = self.results[i]
         f = self.files[i]
-        ext = Path(f).suffix.lower()
 
-        # 函数内导入，避免模块级触发重型模块加载
-        from invoice_parser import render_invoice_name
-        from recognizer import render_template
-
-        # 生成新文件名（沿用「时间前缀」勾选状态与模板）
-        if parsed and parsed.get("status") == "success":
-            if parsed.get("kind") == "invoice":
-                new_name = render_invoice_name(parsed, self.set_invoice_category.text())
-            elif self.set_prefix_date.isChecked() and parsed.get("order_time"):
-                new_name = f"{parsed['order_time']}{parsed.get('platform', '')}{parsed.get('amount', '')}{ext}"
-            else:
-                new_name = render_template(
-                    self.set_template.text(), parsed.get("amount"),
-                    parsed.get("platform", ""), ext,
-                )
+        # 金额+平台齐全即生成新文件名（含失败项：缺商品名但仍可改名）
+        new_name = self._make_new_name(i, parsed)
+        if new_name:
             self.table.setItem(i, COL_NEWNAME, QTableWidgetItem(new_name))
-        else:
-            new_name = ""
 
         entry = self._build_log_entry(i, f, parsed, new_name)
-        if not parsed or parsed.get("status") != "success" or not new_name:
+        if not parsed or not new_name:
             entry["status"] = "failed"
             entry["new_name"] = None
-            entry["reason"] = (parsed or {}).get("reason", "识别失败或未生成新文件名")
+            entry["reason"] = (parsed or {}).get("reason", "未生成新文件名")
+            return entry
+
+        # 金额+平台齐全但状态失败（如缺商品名）→ 仍重命名，状态保持失败
+        keep_failed = parsed.get("status") != "success"
+        if keep_failed and not self._renamable(parsed):
+            entry["status"] = "failed"
+            entry["new_name"] = None
+            entry["reason"] = (parsed or {}).get("reason", "识别失败")
             return entry
 
         target, skip_flag = self._resolve_target(folder, new_name, strategy, f)
@@ -956,11 +949,18 @@ class MainWindow(QMainWindow):
                 entry["_old_abs"] = str(src)
                 entry["_new_abs"] = str(target)
             self.table.setItem(i, COL_ORIG, QTableWidgetItem(target.name))
-            self.table.setItem(i, COL_STATUS, QTableWidgetItem("已重命名"))
-            entry["status"] = "success"
-            entry["new_name"] = target.name
-            if is_noop:
-                entry["reason"] = "已符合命名规则，无需改名"
+            if keep_failed:
+                # 金额+平台齐全但缺商品名：文件仍改名，状态保持失败
+                self.table.setItem(i, COL_STATUS, QTableWidgetItem("失败·已重命名"))
+                entry["status"] = "failed"
+                entry["new_name"] = target.name
+                entry["reason"] = (parsed or {}).get("reason", "缺少商品名称")
+            else:
+                self.table.setItem(i, COL_STATUS, QTableWidgetItem("已重命名"))
+                entry["status"] = "success"
+                entry["new_name"] = target.name
+                if is_noop:
+                    entry["reason"] = "已符合命名规则，无需改名"
         except Exception as e:  # noqa: BLE001
             entry["status"] = "failed"
             entry["new_name"] = None
@@ -1074,6 +1074,32 @@ class MainWindow(QMainWindow):
             self.execute_rename()
 
     # ---------- M4：重命名 / 日志 / 撤销 ----------
+    def _renamable(self, parsed) -> bool:
+        """失败项仍可重命名：金额 + 平台齐全（即能生成有效新文件名）。"""
+        return bool(
+            parsed
+            and parsed.get("amount") is not None
+            and parsed.get("platform")
+        )
+
+    def _make_new_name(self, i: int, parsed) -> str:
+        """按当前设置生成新文件名；金额+平台齐全即生成（含失败项，供仍重命名）。
+
+        返回 '' 表示无法生成（金额/平台缺失或发票模板缺字段）。
+        """
+        if not self._renamable(parsed):
+            return ""
+        from invoice_parser import render_invoice_name
+        from recognizer import render_template
+        ext = Path(self.files[i]).suffix.lower()
+        if parsed.get("kind") == "invoice":
+            return render_invoice_name(parsed, self.set_invoice_category.text())
+        if self.set_prefix_date.isChecked() and parsed.get("order_time"):
+            return f"{parsed['order_time']}{parsed.get('platform', '')}{parsed.get('amount', '')}{ext}"
+        return render_template(
+            self.set_template.text(), parsed.get("amount"), parsed.get("platform", ""), ext
+        )
+
     def execute_rename(self):
         # 函数内导入，避免模块级触发重型模块加载
         from invoice_parser import render_invoice_name
@@ -1090,23 +1116,16 @@ class MainWindow(QMainWindow):
         # 勾选 → 时间+平台+价格；未勾选 → 模板格式（不含时间前缀）。
         # 支持：先识别（不勾选）→ 看结果 → 再勾选/取消 → 点执行重命名即生效。
         for i, parsed in enumerate(self.results):
-            if not parsed or parsed.get("status") != "success":
-                continue
-            ext = Path(self.files[i]).suffix.lower()
-            if parsed.get("kind") == "invoice":
-                # 发票：独立模板（类别值来自设置页）
-                new_name = render_invoice_name(parsed, self.set_invoice_category.text())
-            elif self.set_prefix_date.isChecked() and parsed.get("order_time"):
-                new_name = f"{parsed['order_time']}{parsed.get('platform', '')}{parsed.get('amount', '')}{ext}"
-            else:
-                new_name = render_template(
-                    self.set_template.text(), parsed.get("amount"), parsed.get("platform", ""), ext
-                )
-            self.table.setItem(i, COL_NEWNAME, QTableWidgetItem(new_name))
+            # 金额+平台齐全即生成新文件名（含失败项：缺商品名但仍可改名）
+            new_name = self._make_new_name(i, parsed)
+            if new_name:
+                self.table.setItem(i, COL_NEWNAME, QTableWidgetItem(new_name))
 
         fail_handling = self.set_fail.currentText()
+        # 金额+平台齐全的失败项（如缺商品名）仍可改名，不算阻断性失败
         has_fail = any(
-            r and r["status"] != "success" for r in self.results if r
+            r and r["status"] != "success" and not self._renamable(r)
+            for r in self.results if r
         )
         if fail_handling.startswith("中止") and has_fail:
             self.status_label.setText("存在识别失败项，已按设置中止重命名")
@@ -1116,19 +1135,28 @@ class MainWindow(QMainWindow):
         folder = Path(self.folder_path)
         entries = []
         renamed = []
-        done = skipped = 0
+        done = skipped = renamed_fail = 0
 
         for i, f in enumerate(self.files):
             parsed = self.results[i]
             new_name = self.table.item(i, COL_NEWNAME).text().strip()
             entry = self._build_log_entry(i, f, parsed, new_name)
 
-            if not parsed or parsed["status"] != "success" or not new_name:
+            if not parsed or not new_name:
                 entry["status"] = "failed"
                 entry["new_name"] = None
                 entry["reason"] = (parsed or {}).get(
-                    "reason", "识别失败或未生成新文件名"
+                    "reason", "未生成新文件名"
                 )
+                entries.append(entry)
+                skipped += 1
+                continue
+            # 金额+平台齐全但状态失败（如缺商品名）→ 仍重命名，状态保持失败
+            keep_failed = parsed["status"] != "success"
+            if keep_failed and not self._renamable(parsed):
+                entry["status"] = "failed"
+                entry["new_name"] = None
+                entry["reason"] = (parsed or {}).get("reason", "识别失败")
                 entries.append(entry)
                 skipped += 1
                 continue
@@ -1150,12 +1178,20 @@ class MainWindow(QMainWindow):
                     renamed.append((str(src), str(target)))
                     self.files[i] = target  # 同步路径，供二次重命名/识别复用
                 self.table.setItem(i, 0, QTableWidgetItem(target.name))
-                self.table.setItem(i, COL_STATUS, QTableWidgetItem("已重命名"))
-                entry["status"] = "success"
-                entry["new_name"] = target.name
-                if is_noop:
-                    entry["reason"] = "已符合命名规则，无需改名"
-                done += 1
+                if keep_failed:
+                    # 金额+平台齐全但缺商品名：文件仍改名，状态保持失败
+                    self.table.setItem(i, COL_STATUS, QTableWidgetItem("失败·已重命名"))
+                    entry["status"] = "failed"
+                    entry["new_name"] = target.name
+                    entry["reason"] = (parsed or {}).get("reason", "缺少商品名称")
+                    renamed_fail += 1
+                else:
+                    self.table.setItem(i, COL_STATUS, QTableWidgetItem("已重命名"))
+                    entry["status"] = "success"
+                    entry["new_name"] = target.name
+                    if is_noop:
+                        entry["reason"] = "已符合命名规则，无需改名"
+                    done += 1
             except Exception as e:  # noqa: BLE001
                 entry["status"] = "failed"
                 entry["new_name"] = None
@@ -1166,7 +1202,7 @@ class MainWindow(QMainWindow):
         self._write_log(folder, entries)
         self.last_renames = renamed
         self.status_label.setText(
-            f"重命名完成：成功 {done}，跳过/失败 {skipped}，日志已生成"
+            f"重命名完成：成功 {done}，失败仍改名 {renamed_fail}，跳过 {skipped}，日志已生成"
         )
 
     def _resolve_target(self, folder: Path, new_name: str, strategy: str, src=None):
@@ -1245,6 +1281,7 @@ class MainWindow(QMainWindow):
                 "amount": parsed.get("amount"),
                 "product_name": parsed.get("product_name"),
                 "status": parsed.get("status"),
+                "reason": parsed.get("reason", ""),
                 "used_model": bool(parsed.get("used_model")),
                 "ocr_text": parsed.get("ocr_text", ""),
                 "timestamp": datetime.now().isoformat(timespec="seconds"),

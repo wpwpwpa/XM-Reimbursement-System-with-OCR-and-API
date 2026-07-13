@@ -11,6 +11,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 from order_fields import normalize_date
+from excel_utils import set_col_widths
 
 # 逻辑列 → 候选表头关键词（命中任一即采用该列）
 COLUMN_ALIASES = {
@@ -59,32 +60,33 @@ def load_taobao_excel(path: str) -> dict:
     read_only + data_only，兼容公式计算后的缓存值。
     """
     wb = load_workbook(path, data_only=True, read_only=True)
-    ws = wb.active
-    rows_iter = ws.iter_rows(values_only=True)
     try:
-        headers = list(next(rows_iter))
-    except StopIteration:
-        wb.close()
-        return {"rows": [], "headers": []}
-    idx = {key: _match_header(headers, kws)
-           for key, kws in COLUMN_ALIASES.items()}
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            headers = list(next(rows_iter))
+        except StopIteration:
+            return {"rows": [], "headers": []}
+        idx = {key: _match_header(headers, kws)
+               for key, kws in COLUMN_ALIASES.items()}
 
-    out_rows = []
-    for r in rows_iter:
-        if r is None or all(c is None for c in r):
-            continue
-        row = {
-            "price": _to_float(r[idx["price"]]) if idx["price"] >= 0 else None,
-            "order_time": normalize_date(r[idx["order_time"]])
-            if idx["order_time"] >= 0 else None,
-            "product": str(r[idx["product"]]).strip()
-            if (idx["product"] >= 0 and r[idx["product"]] is not None) else None,
-            "order_no": str(r[idx["order_no"]]).strip()
-            if (idx["order_no"] >= 0 and r[idx["order_no"]] is not None) else None,
-        }
-        out_rows.append(row)
-    wb.close()
-    return {"rows": out_rows, "headers": [str(h) for h in headers]}
+        out_rows = []
+        for r in rows_iter:
+            if r is None or all(c is None for c in r):
+                continue
+            row = {
+                "price": _to_float(r[idx["price"]]) if idx["price"] >= 0 else None,
+                "order_time": normalize_date(r[idx["order_time"]])
+                if idx["order_time"] >= 0 else None,
+                "product": str(r[idx["product"]]).strip()
+                if (idx["product"] >= 0 and r[idx["product"]] is not None) else None,
+                "order_no": str(r[idx["order_no"]]).strip()
+                if (idx["order_no"] >= 0 and r[idx["order_no"]] is not None) else None,
+            }
+            out_rows.append(row)
+        return {"rows": out_rows, "headers": [str(h) for h in headers]}
+    finally:
+        wb.close()
 
 
 def match_by_price(excel_data: dict, price: float | None):
@@ -173,7 +175,6 @@ def write_order_excel(rows: list[dict], out_path: str) -> str:
     ws.append(headers)
     for r in rows:
         ws.append([r.get(h, "") for h in headers])
-    for col_idx, h in enumerate(headers, start=1):
-        ws.column_dimensions[chr(64 + col_idx)].width = max(12, min(40, len(h) * 3))
+    set_col_widths(ws, [max(12, min(40, len(h) * 3)) for h in headers])
     wb.save(out_path)
     return out_path

@@ -39,6 +39,26 @@ _OCR_PROMPT = (
 )
 
 
+_MODEL_PLACEHOLDER = "gpt-4o-mini"
+
+
+def _build_chat_url(endpoint: str) -> str:
+    """拼接 chat/completions URL（兼容端点以 /v1 结尾或裸 base_url 两种写法）。"""
+    endpoint = endpoint.rstrip("/")
+    if endpoint.endswith("/v1"):
+        return f"{endpoint}/chat/completions"
+    return f"{endpoint}/v1/chat/completions"
+
+
+def _list_model_ids(body: str) -> list | None:
+    """解析 /v1/models 响应，返回已加载模型 id 列表；解析失败返回 None（不阻断校验）。"""
+    try:
+        data = json.loads(body)
+    except Exception:
+        return None
+    return [m.get("id") for m in data.get("data", [])]
+
+
 class LLMBackend(ABC):
     """LLM 解析后端基类。"""
 
@@ -68,10 +88,7 @@ class OpenAICompatibleBackend(LLMBackend):
         self.prompt = prompt  # None → 回退内置 _OCR_PROMPT
 
     def parse(self, ocr_text: str) -> dict:
-        if self.endpoint.endswith("/v1"):
-            url = f"{self.endpoint}/chat/completions"
-        else:
-            url = f"{self.endpoint}/v1/chat/completions"
+        url = _build_chat_url(self.endpoint)
         payload = json.dumps({
             "model": self.model,
             "messages": [
@@ -99,8 +116,6 @@ class OpenAICompatibleBackend(LLMBackend):
 
         content = data.get("choices", [{}])[0].get("message", {})
         raw_content = content.get("content", "")
-        # 调试诊断：记录原始返回内容（便于排查截断/格式问题）
-        _raw_reason = raw_content[:120] if raw_content else "(空)"
         try:
             result = _extract_json(raw_content)
             if not result:
@@ -122,35 +137,6 @@ class OpenAICompatibleBackend(LLMBackend):
                 "status": "failed", "amount": None, "platform": None,
                 "confidence": 0.0, "reason": f"LLM 返回格式异常: {raw_content[:100]}",
             }
-
-    def parse_with_prompt(self, ocr_text: str, custom_prompt: str) -> dict:
-        """仲裁专用：用自定义 prompt 让文字模型判断商品名，返回 {product_name}。
-
-        不走 JSON 结构化解析，直接取模型回复文本作为最终商品名字符串。
-        """
-        if self.endpoint.endswith("/v1"):
-            url = f"{self.endpoint}/chat/completions"
-        else:
-            url = f"{self.endpoint}/v1/chat/completions"
-        payload = json.dumps({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": custom_prompt},
-                {"role": "user", "content": ocr_text[:2000]},
-            ],
-            "temperature": 0.0,
-        }).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception as e:  # noqa: BLE001
-            return {"product_name": None, "reason": f"仲裁请求失败: {e}"}
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return {"product_name": content.strip() or None}
 
     def _test_url(self) -> str:
         """根据端点生成测试连接 URL。
@@ -181,11 +167,20 @@ class OpenAICompatibleBackend(LLMBackend):
             if self.api_key:
                 req.add_header("Authorization", f"Bearer {self.api_key}")
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return True, f"连接成功 ({resp.status})"
+                body = resp.read().decode("utf-8")
         except urllib.error.URLError as e:
             return False, f"连接失败: {e.reason}"
         except Exception as e:
             return False, f"连接失败: {e}"
+
+        # 端点可达 ≠ 模型就绪：校验所填模型是否已加载（仅当显式指定、非默认占位时）
+        if self.model and self.model != _MODEL_PLACEHOLDER:
+            ids = _list_model_ids(body)
+            if ids is not None and self.model not in ids:
+                avail = ", ".join(ids) if ids else "无"
+                return False, f"连接成功，但模型「{self.model}」未加载（可用: {avail}）"
+        loaded = (self.model and self.model != _MODEL_PLACEHOLDER)
+        return True, "连接成功（模型已加载）" if loaded else "连接成功"
 
 
 class StubLLMBackend(LLMBackend):
@@ -395,11 +390,7 @@ class VisionBackend:
             return _vision_fail(f"读取/压缩图片失败: {e}")
         data_uri = f"data:image/{mime};base64,{b64}"
 
-        # 智能拼接 /v1 前缀（与 _test_url 逻辑一致）
-        if self.endpoint.endswith("/v1"):
-            url = f"{self.endpoint}/chat/completions"
-        else:
-            url = f"{self.endpoint}/v1/chat/completions"
+        url = _build_chat_url(self.endpoint)
         payload = json.dumps({
             "model": self.model,
             "messages": [
@@ -425,61 +416,6 @@ class VisionBackend:
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         return _normalize_vision(_extract_json(content))
 
-    def parse_image_with_prompt(self, image_path: str, custom_prompt: str) -> dict:
-        """仲裁专用：用自定义 prompt 让多模态模型判断商品名，返回 {product_name}。
-
-        复用 base64 压缩逻辑，重新送图 + 自定义 prompt，直接取回复文本作商品名。
-        """
-        p = Path(image_path)
-        if not p.exists():
-            return {"product_name": None, "reason": "文件不存在"}
-        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png"}.get(
-            p.suffix.lower().lstrip("."), "png"
-        )
-        try:
-            from PIL import Image as _PILImage
-            _img = _PILImage.open(p)
-            if _img.mode in ("RGBA", "P", "LA"):
-                _img = _img.convert("RGB")
-            _MAX_EDGE = 1024
-            w, h = _img.size
-            if max(w, h) > _MAX_EDGE:
-                _ratio = _MAX_EDGE / max(w, h)
-                _img = _img.resize((int(w * _ratio), int(h * _ratio)), _PILImage.LANCZOS)
-            _buf = __import__("io").BytesIO()
-            _img.save(_buf, format="JPEG", quality=85)
-            b64 = base64.b64encode(_buf.getvalue()).decode("ascii")
-        except Exception as e:  # noqa: BLE001
-            return {"product_name": None, "reason": f"读取/压缩图片失败: {e}"}
-        data_uri = f"data:image/{mime};base64,{b64}"
-
-        if self.endpoint.endswith("/v1"):
-            url = f"{self.endpoint}/chat/completions"
-        else:
-            url = f"{self.endpoint}/v1/chat/completions"
-        payload = json.dumps({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": custom_prompt},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                    {"type": "text", "text": "请根据上述图片核对商品名。"},
-                ]},
-            ],
-            "temperature": 0.0,
-        }).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception as e:  # noqa: BLE001
-            return {"product_name": None, "reason": f"视觉仲裁请求失败: {e}"}
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return {"product_name": content.strip() or None}
-
     def _test_url(self) -> str:
         """根据端点生成测试连接 URL（与 OpenAICompatibleBackend 逻辑一致）。"""
         ep = self.endpoint
@@ -502,11 +438,19 @@ class VisionBackend:
             if self.api_key:
                 req.add_header("Authorization", f"Bearer {self.api_key}")
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return True, f"连接成功 ({resp.status})"
+                body = resp.read().decode("utf-8")
         except urllib.error.URLError as e:
             return False, f"连接失败: {e.reason}"
         except Exception as e:
             return False, f"连接失败: {e}"
+
+        # 端点可达 ≠ 模型就绪：视觉模型必显式指定，校验其是否已加载
+        if self.model:
+            ids = _list_model_ids(body)
+            if ids is not None and self.model not in ids:
+                avail = ", ".join(ids) if ids else "无"
+                return False, f"连接成功，但模型「{self.model}」未加载（可用: {avail}）"
+        return True, "连接成功（模型已加载）" if self.model else "连接成功"
 
 
 def build_vision_backend(kind: str, cfg: dict) -> VisionBackend | None:

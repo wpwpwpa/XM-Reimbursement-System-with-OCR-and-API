@@ -34,78 +34,23 @@ def render_template(tpl: str, amount, platform, ext: str) -> str:
     )
 
 
-def _normalize_llm(raw: dict) -> dict:
-    """把 LLM 后端返回的字典规范化成与 parse() 同构。"""
-    return {
-        "status": raw.get("status", "failed"),
-        "amount": raw.get("amount"),
-        "platform": raw.get("platform"),
-        "confidence": raw.get("confidence", 0.0),
-        "reason": raw.get("reason", ""),
-        "used_llm": True,
-    }
-
-
 def recognize_one(backend, image_path, threshold: float = DEFAULT_THRESHOLD,
                   llm=None) -> dict:
-    """单图识别：RapidOCR → 正则 parse（金额+平台）；商品名由大模型识别。
+    """单图识别（薄封装 recognize_image_gated）。
 
-    设计（方案A：简化门控，直接让模型判商品名，不对比不二次仲裁）：
-    - 金额 / 平台 / 时间：正则抽取为主。
-    - 商品名称：直接由大模型识别（文本模型→llm.parse）。仅一次 LLM 调用取其
-      product_name。模型结果经 _is_bad_product 质检：有效则用模型值；模型返回
-      垃圾/空则回退正则抽到的商品名（免费，不再二次调模型）。
-    - 淘宝商品名留空待 Excel 按价格匹配补全。
-    backend 由调用方创建并复用（RapidOCR 模型加载较重）。
+    金额/平台/时间正则为主，商品名由大模型兜底补缺——逻辑统一收敛到
+    recognize_image_gated，避免两份门控分叉。
+
+    backend: OcrBackend 实例（RapidOCR 模型加载较重，调用方创建复用）。
     llm: 可选的 LLMBackend 实例（None = 纯正则，不调任何模型 → 商品名留空）。
+        提供时转为 model_fn 委托给 gated；其返回形如 {amount, platform,
+        product_name, order_time}，与 gated 的 model_fn 契约一致。
     """
-    from m1_poc.parser import parse
-
-    text = backend.recognize(image_path)
-    result = parse(text, threshold)        # 正则：金额 + 平台
-    platform = result.get("platform")
-
-    # 图片侧时间：拼多多/美团 取关键词；淘宝留空待 Excel
-    time_img = extract_order_time(text, platform) if platform in ("拼多多", "美团") else None
-    # 商品名基线：正则抽取（仅作兜底，模型档下优先用模型结果）
-    product = extract_product_name(text, platform) if platform in ("拼多多", "美团") else None
-    if product and _is_bad_product(product):   # 质检：垃圾值视为空
-        product = None
-
-    # 大模型判断商品名（方案A：一次调用，直接采用，不对比不仲裁）
-    llm_raw = None
+    model_fn = None
     if llm is not None:
-        try:
-            llm_raw = llm.parse(text)
-        except Exception:  # noqa: BLE001
-            llm_raw = None
-
-    if llm_raw is not None:
-        lp = llm_raw.get("product_name") or None
-        if lp and not _is_bad_product(lp):
-            product = lp                      # 模型有效 → 直接采用
-        # 模型坏/空 → 保留正则兜底 product（不再二次调模型）
-        lt = normalize_date(llm_raw.get("order_time"))
-        if time_img is None and lt:
-            time_img = lt                    # 正则漏抽时间时由 LLM 补
-
-    result["order_time"] = time_img
-    result["product_name"] = product
-    result["ocr_text"] = text                 # 透传 OCR 原文
-
-    if result["status"] == "success":
-        return result
-
-    # 正则失败：若大模型给出金额/平台则兜底（安全网）
-    if llm_raw is not None:
-        norm = _normalize_llm(llm_raw)
-        if norm["status"] == "success":
-            norm["reason"] = f"正则未匹配({result.get('reason', '')})，已由 LLM 兜底"
-            norm["order_time"] = time_img
-            norm["product_name"] = product
-            norm["ocr_text"] = text
-            return norm
-    return result
+        model_fn = lambda path, text: llm.parse(text)
+    return recognize_image_gated(backend, image_path, model_fn=model_fn,
+                                 threshold=threshold)
 
 
 def _need_model(result: dict) -> bool:

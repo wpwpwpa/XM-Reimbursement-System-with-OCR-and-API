@@ -22,11 +22,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from excel_utils import set_col_widths
 
 import warnings
-warnings.filterwarnings(
-    "ignore", message="Workbook contains no default style", category=UserWarning
-)
 
 
 def _build_reason(order_time: str | None, platform: str,
@@ -135,10 +133,13 @@ def write_reimbursement_excel(template_path: str, expense_type: str,
         for c, h in enumerate(headers, start=1):
             ws.cell(row=r_idx, column=c, value=row.get(h, ""))
 
-    # 列宽（参考 order_excel 风格）
-    for c in range(1, len(headers) + 1):
-        ws.column_dimensions[chr(64 + c)].width = 22
+    # 列宽（共享 helper，支持 > 26 列）
+    set_col_widths(ws, [22] * len(headers))
 
     out_path = str(Path(out_path).with_suffix(".xlsx"))
-    new_wb.save(out_path)
+    # 局部屏蔽 openpyxl 的"Workbook contains no default style"提示，
+    # 不污染全局警告设置（避免掩盖其他真实问题）
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        new_wb.save(out_path)
     return out_path

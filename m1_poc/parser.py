@@ -80,7 +80,7 @@ def synthesize_confidence(amount, platform) -> float:
 
 
 def parse(text: str, confidence_threshold: float = 0.70) -> dict:
-    """纯文本 → 统一 JSON。金额/日期正则优先，LLM 增强留接口(本期未接)。"""
+    """纯文本 → 统一 JSON。金额/日期正则优先；LLM/视觉兜底在 recognizer 层（方案A 直接采用模型结果，不在此层）。"""
     platform = detect_platform(text)
     amount = extract_amount(text)
     confidence = synthesize_confidence(amount, platform)

@@ -21,19 +21,19 @@ _INVOICE_NO_RE = re.compile(r"\b(\d{20})\b")
 _PRODUCT_RE = re.compile(r"\*[^*]+\*")  # 税收分类：*蔬菜* / *日用杂品*
 
 
+def _to_ymd(y, mo, d) -> str | None:
+    """把年/月/日组成本地化 YYYY-MM-DD；任一非数字则 None。"""
+    try:
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    except Exception:
+        return None
+
+
 def _norm_date(cn=None, dash=None) -> str | None:
     if cn:
-        y, mo, d = int(cn.group(1)), int(cn.group(2)), int(cn.group(3))
-        try:
-            return f"{y:04d}-{mo:02d}-{d:02d}"
-        except Exception:
-            return None
+        return _to_ymd(cn.group(1), cn.group(2), cn.group(3))
     if dash:
-        y, mo, d = int(dash.group(1)), int(dash.group(2)), int(dash.group(3))
-        try:
-            return f"{y:04d}-{mo:02d}-{d:02d}"
-        except Exception:
-            return None
+        return _to_ymd(dash.group(1), dash.group(2), dash.group(3))
     return None
 
 

@@ -57,13 +57,24 @@ def _require_product_for_images(result: dict) -> None:
     """图片四要素（金额/平台/日期/商品名）齐全才算成功。
 
     发票（kind=invoice）商品名是税目分类、非真实商品名，不适用此规则。
-    仅对当前 success 的图片降级：缺商品名 → failed + 原因标注。
+    仅对当前 success 的图片降级：缺任一要素 → failed + 原因标注。
     """
     if result.get("kind") == "invoice":
         return
-    if result.get("status") == "success" and not result.get("product_name"):
+    if result.get("status") != "success":
+        return
+    missing = []
+    if result.get("amount") is None:
+        missing.append("金额")
+    if not result.get("platform"):
+        missing.append("平台")
+    if not result.get("order_time"):
+        missing.append("日期")
+    if not result.get("product_name"):
+        missing.append("商品名")
+    if missing:
         result["status"] = "failed"
-        result["reason"] = (result.get("reason") or "") + "（缺少商品名称）"
+        result["reason"] = (result.get("reason") or "") + "（缺少" + "、".join(missing) + "）"
 
 
 def _need_model(result: dict) -> bool:
@@ -111,8 +122,8 @@ def recognize_image_gated(backend, image_path, model_fn=None,
     platform = result.get("platform")
     # 拼多多/美团 可从文本正则抽时间；淘宝留空待 Excel
     time_img = extract_order_time(text, platform) if platform in ("拼多多", "美团") else None
-    # 商品名基线：正则抽取（仅作兜底，模型档下优先模型）
-    product = extract_product_name(text, platform) if platform in ("拼多多", "美团") else None
+    # 商品名：正则抽取（所有平台均尝试；模型档下优先模型）
+    product = extract_product_name(text, platform)
     if product and _is_bad_product(product):   # 质检：垃圾值视为空
         product = None
     result["order_time"] = time_img

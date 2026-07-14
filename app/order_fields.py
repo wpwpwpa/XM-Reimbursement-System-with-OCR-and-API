@@ -198,6 +198,82 @@ def _find_first(lines, pred):
     return None
 
 
+def _find_anchor_crossline(lines, *keywords):
+    """跨行锚点：淘宝「实付款」与「￥XX」常拆成相邻两行。
+
+    返回 ￥ 所在行号（回溯终点），找不到返回 None。
+    """
+    for i, ln in enumerate(lines):
+        has_kw = any(k in ln for k in keywords)
+        if has_kw and i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if ("￥" in nxt or "¥" in nxt) and re.search(r"[￥¥]\s*\d", nxt):
+                return i + 1  # ￥ 行作为锚点
+        # 反向：当前行是￥，上一行是关键词
+        if ("￥" in ln or "¥" in ln) and re.search(r"[￥¥]\s*\d", ln) and i > 0:
+            prev = lines[i - 1]
+            if any(k in prev for k in keywords):
+                return i  # 当前行就是 ￥ 锚点
+    return None
+
+
+def _extract_below_taobao_shop(lines) -> str | None:
+    """淘宝/天猫专用：找到店铺行，取其后紧邻的商品名行。
+
+    淘宝/天猫 OCR 结构固定：店铺行（含淘宝/天猫/旗舰店/专营店，或以「企」开头，
+    或以〉/>结尾）→ 商品名行 → 规格/单价。
+    「企」开头判定与 detect_platform 的「企」特征词对齐（淘宝企业店命名惯例）。
+    跳过店铺行本身和过短行（<4字），取首个像商品名的非噪声行。
+    """
+    # 非商品行关键词：费用/营销/UI 文案绝非商品名
+    _non_product = (
+        "运费", "优惠", "立减", "抵扣", "红包", "礼金", "淘金币",
+        "VIP", "好评", "客服", "满意度", "支付", "商品总价",
+        "申请售后", "闲鱼", "加入购物", "极速退款", "退货宝",
+        "假一赔四", "价保", "不支", "发货只卖", "x1", "x3",
+        "规格", "数量", "包装", "全封",
+    )
+    shop_keywords = ("淘宝", "天猫", "旗舰店", "专营店", "专卖店")
+    for i, ln in enumerate(lines):
+        # 匹配店铺行：含店铺关键词 / 以「企」开头（淘宝企业店） / 以〉>结尾
+        is_shop = any(k in ln for k in shop_keywords)
+        if not is_shop and ln.startswith("企"):
+            # 以「企」开头 → 淘宝企业店店铺名（与 detect_platform 的「企」特征词对齐）
+            is_shop = True
+        if not is_shop and (ln.endswith("》") or ln.endswith(">")):
+            # 以〉结尾的非噪声、非短行 → 可能是店铺名（如「企蔬语种业7>」）
+            if not _line_is_noise(ln) and len(ln) > 4:
+                is_shop = True
+        if not is_shop:
+            continue
+        # 向下扫描 5 行内找商品名
+        for j in range(i + 1, min(i + 6, len(lines))):
+            candidate = lines[j].strip()
+            if not candidate or len(candidate) < 4:
+                continue
+            # 价格行：若商品名与￥混在同一行，提取￥前文本
+            if ("￥" in candidate or "¥" in candidate) and re.search(r"[￥¥]\s*\d", candidate):
+                before_price = re.split(r"[￥¥]", candidate)[0].strip()
+                before_price = _strip_spec(before_price)
+                if before_price and len(before_price) >= 4 and not _is_bad_product(before_price):
+                    return before_price
+                break
+            if _line_is_noise(candidate):
+                continue
+            # 过滤明显的非商品行
+            if any(np_kw in candidate for np_kw in _non_product):
+                continue
+            # 跳过评分/纯数字型号行（如「4.7（2号288）」「BKMAMLAB」）
+            if re.match(r'^[\d\s().（）a-zA-Z]+$', candidate):
+                continue
+            if not _looks_like_product(candidate):
+                continue  # 改为 continue：跳过而非 break，允许继续扫
+            cleaned = _strip_spec(candidate)
+            if cleaned and not _is_bad_product(cleaned):
+                return cleaned
+    return None
+
+
 def _extract_by_label(lines):
     """原 PRODUCT_LABELS 策略：取标签后文本（或下一非空行）。"""
     skip_prefixes = ("实付", "合计", "下单", "期望", "订单", "金额", "运费", "优惠")
@@ -224,9 +300,12 @@ def _extract_by_price_anchor(lines, platform):
     商品名不会被金额/数量符号拆分，故符号两侧文本段拼接即完整标题。
     """
     n = len(lines)
-    if platform == "美团":
+    if platform in ("美团", "淘宝"):
         anchor = _find_first(lines, lambda ln: ("实付" in ln or "实付款" in ln)
                              and ("￥" in ln or "¥" in ln))
+        # 淘宝常将「实付款」与「￥」拆成两行 → 跨行兜底
+        if anchor is None and platform == "淘宝":
+            anchor = _find_anchor_crossline(lines, "实付款", "实付")
     else:  # 拼多多
         anchor = _find_first(lines, lambda ln: ("￥" in ln or "¥" in ln)
                              and re.search(r"[￥¥]\s*\d", ln))
@@ -266,15 +345,16 @@ def _extract_by_price_anchor(lines, platform):
 
 
 def extract_product_name(text: str, platform: str | None) -> str | None:
-    """从 OCR 文本抽商品名（拼多多/美团）。淘宝返回 None（来自 Excel）。
+    """从 OCR 文本抽商品名（支持拼多多/美团/淘宝）。
 
     策略：
     1) PRODUCT_LABELS 优先（订单含「商品名称/宝贝标题」等标签时直接取其后文本）。
     2) 标签缺失时兜底：金额锚点法——商品名 = 夹在噪声结构之间的纯文本段。
-       - 美团：首个「实付￥」为终点，向上回溯跳过店/群/状态到首个商品行。
+       - 美团/淘宝：首个「实付￥」为终点，向上回溯跳过店/群/状态到首个商品行。
        - 拼多多：首个「￥数字」为主行，向上回溯到首个商品行、向下取续行。
+    3) 含「约」生鲜重量估算兜底（仅美团）。
     """
-    if not platform or platform not in ("拼多多", "美团"):
+    if not platform or platform not in ("拼多多", "美团", "淘宝"):
         return None
     lines = _lines(text)
     if not lines:
@@ -284,6 +364,12 @@ def extract_product_name(text: str, platform: str | None) -> str | None:
     by_label = _extract_by_label(lines)
     if by_label:
         return by_label
+
+    # 1.5) 淘宝专用：店铺行下方紧邻文本（淘宝 OCR 固定结构：店铺→商品名→价格）
+    if platform == "淘宝":
+        by_shop = _extract_below_taobao_shop(lines)
+        if by_shop:
+            return by_shop
 
     # 2) 金额锚点兜底
     by_anchor = _extract_by_price_anchor(lines, platform)

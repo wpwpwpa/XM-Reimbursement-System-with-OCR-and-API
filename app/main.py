@@ -363,6 +363,25 @@ class RecognitionWorker(QThread):
                 else:
                     self.warn.emit(f"淘宝图片未在Excel中找到对应订单（商品名：{pn}）")
 
+        # 4. 名称/日期补填后重新判定状态（四要素复查）：
+        #    淘宝等图片的商品名/日期可能在 _postprocess（Excel 匹配）才补齐；
+        #    这里对图片失败行做完整四要素复查：四要素齐 → 翻回 success；
+        #    不齐 → 保持 failed（仍按金额+平台执行重命名，状态显示失败）。
+        for p in parsed_list:
+            if p.get("kind") == "invoice":
+                continue
+            if p.get("status") != "failed":
+                continue
+            ok = (
+                p.get("amount") is not None
+                and bool(p.get("platform"))
+                and bool(p.get("order_time"))
+                and bool(p.get("product_name"))
+            )
+            if ok:
+                p["status"] = "success"
+                p["reason"] = None
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -950,8 +969,8 @@ class MainWindow(QMainWindow):
                 entry["_new_abs"] = str(target)
             self.table.setItem(i, COL_ORIG, QTableWidgetItem(target.name))
             if keep_failed:
-                # 金额+平台齐全但缺商品名：文件仍改名，状态保持失败
-                self.table.setItem(i, COL_STATUS, QTableWidgetItem("失败·已重命名"))
+                # 金额+平台齐全但缺商品名：文件仍改名，状态保持失败（红色显示）
+                self._set_red_status(i, "失败·已重命名")
                 entry["status"] = "failed"
                 entry["new_name"] = target.name
                 entry["reason"] = (parsed or {}).get("reason", "缺少商品名称")
@@ -1100,6 +1119,12 @@ class MainWindow(QMainWindow):
             self.set_template.text(), parsed.get("amount"), parsed.get("platform", ""), ext
         )
 
+    def _set_red_status(self, row: int, text: str) -> None:
+        """状态列写入红色文字（前缀带红色 ✗），用于失败但仍改名的行。"""
+        cell = QTableWidgetItem(f"✗ {text}")
+        cell.setForeground(QBrush(QColor("#e74c3c")))
+        self.table.setItem(row, COL_STATUS, cell)
+
     def execute_rename(self):
         # 函数内导入，避免模块级触发重型模块加载
         from invoice_parser import render_invoice_name
@@ -1179,8 +1204,8 @@ class MainWindow(QMainWindow):
                     self.files[i] = target  # 同步路径，供二次重命名/识别复用
                 self.table.setItem(i, 0, QTableWidgetItem(target.name))
                 if keep_failed:
-                    # 金额+平台齐全但缺商品名：文件仍改名，状态保持失败
-                    self.table.setItem(i, COL_STATUS, QTableWidgetItem("失败·已重命名"))
+                    # 金额+平台齐全但缺商品名：文件仍改名，状态保持失败（红色显示）
+                    self._set_red_status(i, "失败·已重命名")
                     entry["status"] = "failed"
                     entry["new_name"] = target.name
                     entry["reason"] = (parsed or {}).get("reason", "缺少商品名称")

@@ -48,7 +48,7 @@ def recognize_one(backend, image_path, threshold: float = DEFAULT_THRESHOLD,
     """
     model_fn = None
     if llm is not None:
-        model_fn = lambda path, text: llm.parse(text)
+        model_fn = lambda path, text, regex: llm.parse(text, regex_result=regex)
     return recognize_image_gated(backend, image_path, model_fn=model_fn,
                                  threshold=threshold)
 
@@ -92,7 +92,8 @@ def _need_model(result: dict) -> bool:
 
 
 def recognize_image_gated(backend, image_path, model_fn=None,
-                          threshold: float = DEFAULT_THRESHOLD) -> dict:
+                          threshold: float = DEFAULT_THRESHOLD,
+                          force_model: bool = False) -> dict:
     """门控识别（方案A：简化）：OCR+正则前置拿金额/平台/时间；拼多多/美团配了模型
     则直接调模型判断商品名，不再先抽正则候选对比、不再二次仲裁。
 
@@ -100,6 +101,8 @@ def recognize_image_gated(backend, image_path, model_fn=None,
     model_fn: 兜底引擎，签名 model_fn(image_path, ocr_text) -> dict。
               None = 纯前端不调模型，商品名用正则兜底。
     threshold: 置信度阈值。
+    force_model: 用户「调试强制」开关。True=每张图都调模型（核对/调试用）；
+                 False=智能门控，仅正则未拿全时调模型（默认）。
 
     策略：
     - 金额/平台：正则为主（准）。
@@ -128,35 +131,42 @@ def recognize_image_gated(backend, image_path, model_fn=None,
         product = None
     result["order_time"] = time_img
     result["product_name"] = product
+    # 快照纯正则输出（调模型前），供日志对比「正则抽到啥 vs 模型补啥」
+    result["regex_result"] = {
+        "amount": result.get("amount"),
+        "platform": result.get("platform"),
+        "order_time": result.get("order_time"),
+        "product_name": result.get("product_name"),
+        "confidence": result.get("confidence"),
+    }
 
-    # 门控：拼多多/美团 + 配模型 → 始终跑（直接让模型判商品名）；
-    #       其余（非拼多多/美团 或 纯正则档）走原 _need_model。
-    always_run = platform in ("拼多多", "美团") and model_fn is not None
-    if model_fn is None or (not always_run and not _need_model(result)):
+    # 门控（由用户「调试强制」开关控制，force_model 来自 UI）：
+    #   force_model=True  → 每张图都调模型（以模型为准，用于核对/调试）；
+    #   force_model=False → 智能门控：仅当正则未拿全（缺商品名/状态非 success）才调模型。
+    #   注：拼多多/美团 正则通常拿不到商品名，智能门控下仍会自然触发模型，
+    #       无需单独 always_run 分支。
+    if model_fn is None or (not force_model and not _need_model(result)):
         _require_product_for_images(result)
         return result
 
     # 直接调模型判断（方案A：一次调用，采用模型商品名，不对比不仲裁）
     try:
-        mres = model_fn(image_path, text)
+        mres = model_fn(image_path, text, result["regex_result"])
     except Exception as e:  # noqa: BLE001
         result["reason"] = (result.get("reason") or "") + f"（模型兜底异常:{e}）"
         return result
 
     if mres:
+        # 模型已是裁判：以模型结果为准，正则仅当模型字段空/坏时兜底（见下方后处理）
+        if mres.get("amount") is not None:
+            result["amount"] = mres["amount"]
+        if mres.get("platform"):
+            result["platform"] = mres["platform"]
+        if mres.get("order_time"):
+            result["order_time"] = normalize_date(mres.get("order_time"))
         B = mres.get("product_name") or None
-        # 直接采用模型商品名；模型坏/空则回退正则兜底（不二次调模型）
         if B and not _is_bad_product(B):
             result["product_name"] = B
-        # 金额/平台/时间补缺（正则为主，模型补空缺）
-        if result.get("amount") is None and mres.get("amount") is not None:
-            result["amount"] = mres["amount"]
-        if not result.get("platform") and mres.get("platform"):
-            result["platform"] = mres["platform"]
-        if not result.get("order_time"):
-            lt = normalize_date(mres.get("order_time"))
-            if lt:
-                result["order_time"] = lt
 
     # 后处理：模型未给 platform 或 product_name 时，用 OCR 文本正则再兜底一次。
     # 这样本地小模型即使只给出 amount，也能配合正则完成识别。
@@ -187,20 +197,25 @@ def recognize_image_gated(backend, image_path, model_fn=None,
         )
         if mres:
             result["used_model"] = True
-            result["reason"] = (result.get("reason") or "") + "（模型兜底补缺）"
+            result["reason"] = (result.get("reason") or "") + "（模型裁判）"
+            # 透传模型原始返回（含完整 content / HTTP 错误体），供日志排查
+            raw = mres.get("model_raw", "")
+            if raw:
+                result["model_raw"] = raw
 
     _require_product_for_images(result)
     return result
 
 
-def recognize_vision(image_path, vision_backend) -> dict:
+def recognize_vision(image_path, vision_backend, regex_result: dict | None = None) -> dict:
     """视觉模式单图识别：截图直送多模态大模型解析金额+平台。
 
     vision_backend: VisionBackend 实例（来自 llm_backend）。
+    regex_result: 正则快照，喂给模型作裁判参考（非数据源）。
     异常兜底为失败，绝不让调用方崩溃。
     """
     try:
-        res = vision_backend.parse_image(image_path)
+        res = vision_backend.parse_image(image_path, regex_result=regex_result)
         res["ocr_text"] = ""  # 视觉模式无 OCR 文本
         return res
     except Exception as e:  # noqa: BLE001

@@ -63,6 +63,47 @@ def _list_model_ids(body: str) -> list | None:
     return [m.get("id") for m in data.get("data", [])]
 
 
+def _reconcile_suffix(regex_result) -> str:
+    """生成「先独立提取、再与正则结果对比裁判」的指令后缀，拼到用户消息。
+
+    要求模型一次输出两段 JSON：
+      independent —— 仅根据原始内容（OCR 文本 / 图片）独立提取，不看正则
+      final        —— 对比正则后裁判选定的最终答案
+
+    无正则时 independent 与 final 同值即可。
+    """
+    _JSON_SCHEMA = (
+        '{"independent": {"amount": 数字或null, "platform": 字符串或null, '
+        '"order_time": 字符串或null, "product_name": 字符串或null}, '
+        '"final": {"amount": 数字或null, "platform": 字符串或null, '
+        '"order_time": 字符串或null, "product_name": 字符串或null}}'
+    )
+
+    if regex_result:
+        try:
+            rx = json.dumps(regex_result, ensure_ascii=False)
+        except Exception:
+            rx = str(regex_result)
+        rx_block = (
+            f"\n\n---\n【正则解析器结果（仅供参考，机器规则可能抽错）】：\n{rx}"
+        )
+        instr = (
+            "\n\n请严格按两步，并按指定格式返回：\n"
+            "1) 先仅根据上面的内容（OCR 文本 / 图片）独立提取 "
+            "amount、platform、order_time、product_name → 填入 independent；\n"
+            "2) 再与上面的正则结果逐字段对比，判断哪个更可信"
+            "（以原始内容为准，正则只是机器规则、可能出错），"
+            "选择更可信的值填入 final。\n"
+            f"只返回 JSON：{_JSON_SCHEMA}。不要返回其他内容。"
+        )
+        return rx_block + instr
+    # 无正则结果：直接提取，independent 与 final 同值
+    return (
+        "\n\n请直接根据上面的内容（OCR 文本 / 图片）提取，"
+        f"只返回 JSON：{_JSON_SCHEMA}。不要返回其他内容。"
+    )
+
+
 class LLMBackend(ABC):
     """LLM 解析后端基类。"""
 
@@ -91,7 +132,7 @@ class OpenAICompatibleBackend(LLMBackend):
         self.model = model or "gpt-4o-mini"
         self.prompt = prompt  # None → 回退内置 _OCR_PROMPT
 
-    def parse(self, ocr_text: str) -> dict:
+    def parse(self, ocr_text: str, regex_result: dict | None = None) -> dict:
         url = _build_chat_url(self.endpoint)
         payload = json.dumps({
             "model": self.model,
@@ -100,8 +141,9 @@ class OpenAICompatibleBackend(LLMBackend):
                     "role": "system",
                     "content": self.prompt or _OCR_PROMPT,
                 },
-                {"role": "user", "content": ocr_text[:2000]},
+                {"role": "user", "content": ocr_text[:2000] + _reconcile_suffix(regex_result)},
             ],
+            "enable_thinking": False,
             "temperature": 0.0,
         }).encode("utf-8")
         headers = {"Content-Type": "application/json"}
@@ -112,6 +154,17 @@ class OpenAICompatibleBackend(LLMBackend):
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 捕获 HTTP 错误体，存完整 body 进 reason，便于排查（如 401 的 key 错误）
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            return {
+                "status": "failed", "amount": None, "platform": None,
+                "confidence": 0.0,
+                "reason": f"LLM 请求失败 HTTP {e.code}: {e.reason} | {err_body[:800]}",
+            }
         except Exception as e:
             return {
                 "status": "failed", "amount": None, "platform": None,
@@ -129,22 +182,32 @@ class OpenAICompatibleBackend(LLMBackend):
             result = _extract_json(raw_content)
             if not result:
                 raise json.JSONDecodeError("empty", raw_content, 0)
-            _plat = result.get("platform")
+
+            # 兼容新旧两种格式：新格式含 independent/final 两段，旧格式为扁平字段
+            final = result.get("final", result)  # 无 final 键则整段当作最终
+            indep = result.get("independent", final)  # 无 independent 则与 final 同值
+
+            _plat = final.get("platform")
             if _plat and "天猫" in str(_plat):
                 _plat = "淘宝"
             return {
                 "status": "success",
-                "amount": result.get("amount"),
+                "amount": final.get("amount"),
                 "platform": _plat,
                 "confidence": 0.85,
                 "used_llm": True,
-                "product_name": result.get("product_name") or None,
-                "order_time": normalize_date(result.get("order_time")),
+                "product_name": final.get("product_name") or None,
+                "order_time": normalize_date(final.get("order_time")),
+                "model_raw": raw_content,
+                "model_independent": indep,   # 模型纯独立提取（未参考正则）
+                "model_final": final,          # 模型裁判后选定
             }
         except (json.JSONDecodeError, AttributeError):
             return {
                 "status": "failed", "amount": None, "platform": None,
-                "confidence": 0.0, "reason": f"LLM 返回格式异常: {raw_content[:100]}",
+                "confidence": 0.0,
+                "reason": f"LLM 返回格式异常: {raw_content[:100]}",
+                "model_raw": raw_content,
             }
 
     def _test_url(self) -> str:
@@ -402,7 +465,7 @@ class VisionBackend:
         self.timeout = timeout
         self.prompt = prompt  # None → 回退内置 _VISION_PROMPT
 
-    def parse_image(self, image_path: str) -> dict:
+    def parse_image(self, image_path: str, regex_result: dict | None = None) -> dict:
         p = Path(image_path)
         if not p.exists():
             return _vision_fail("文件不存在")
@@ -434,9 +497,10 @@ class VisionBackend:
                 {"role": "system", "content": self.prompt or _VISION_PROMPT},
                 {"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": data_uri}},
-                    {"type": "text", "text": "请解析这张报销截图。"},
+                    {"type": "text", "text": "请解析这张报销截图。" + _reconcile_suffix(regex_result)},
                 ]},
             ],
+            "enable_thinking": False,
             "temperature": 0.0,
         }).encode("utf-8")
         headers = {"Content-Type": "application/json"}
@@ -447,6 +511,15 @@ class VisionBackend:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 捕获 HTTP 错误体，存完整 body 进 reason，便于排查（如 401 的 key 错误）
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            return _vision_fail(
+                f"视觉请求失败 HTTP {e.code}: {e.reason} | {err_body[:800]}"
+            )
         except Exception as e:
             return _vision_fail(f"视觉请求失败: {e}")
 
@@ -458,13 +531,20 @@ class VisionBackend:
 
         json_result = _extract_json(content)
         if json_result:
-            return _normalize_vision(json_result)
+            # 兼容新旧格式：新格式含 independent/final，旧格式为扁平字段
+            final = json_result.get("final", json_result)
+            indep = json_result.get("independent", final)
+            res = _normalize_vision(final)
+            res["model_raw"] = content
+            res["model_independent"] = indep   # 模型纯独立提取（未参考正则）
+            res["model_final"] = final          # 模型裁判后选定
+            return res
 
         return _vision_fail(
             f"视觉模型返回内容无法解析为结构化数据 "
             f"(content={'空' if not msg.get('content') else '有值'}, "
             f"reasoning_content={'有值' if msg.get('reasoning_content') else '无'}, "
-            f"文本长度={len(content)})"
+            f"文本长度={len(content)}) | 原文: {content[:800]}"
         )
 
     def _test_url(self) -> str:

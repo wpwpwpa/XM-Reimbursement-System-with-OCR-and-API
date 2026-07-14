@@ -13,6 +13,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+import time
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush
@@ -167,7 +168,8 @@ class RecognitionWorker(QThread):
                  llm_kind: str = "正则判断", llm_cfg: dict | None = None,
                  mode: str = "OCR+文字模型", vision_cfg: dict | None = None,
                  taobao_excel: str | None = None, prefix_date: bool = False,
-                 invoice_category: str = "发票", hint_year: int | None = None):
+                 invoice_category: str = "发票", hint_year: int | None = None,
+                 force_model: bool = False):
         super().__init__()
         self.files = files
         self.template = template
@@ -176,6 +178,7 @@ class RecognitionWorker(QThread):
         self.llm_cfg = llm_cfg or {}
         self.mode = mode
         self.vision_cfg = vision_cfg or {}
+        self.force_model = force_model     # 用户「调试强制」开关：True=每张走模型
         self.taobao_excel = taobao_excel   # 淘宝订单 Excel 路径（可选）
         self.prefix_date = prefix_date     # 重命名时是否把时间前缀到文件名
         self.invoice_category = invoice_category  # 发票文件名末尾的类别值
@@ -252,15 +255,16 @@ class RecognitionWorker(QThread):
         # 方案A：商品名直接由模型判断，不二次仲裁
         model_fn = None
         if is_vision and vision is not None:
-            model_fn = lambda path, _text: recognize_vision(path, vision)
+            model_fn = lambda path, _text, regex: recognize_vision(path, vision, regex_result=regex)
         elif is_text and llm is not None:
-            model_fn = lambda _path, text: llm.parse(text)
+            model_fn = lambda _path, text, regex: llm.parse(text, regex_result=regex)
 
         # 阶段A：逐图识别（门控：正则前置，难图才调模型；不做 Excel/年份后处理）
         parsed_list = []
         for i, f in enumerate(self.files):
             # 单图异常/文件缺失只记失败，绝不让线程崩溃拖垮整个应用
             try:
+                _t0 = time.perf_counter()
                 if not Path(f).exists():
                     parsed = _rec_fail("文件不存在（可能已被移动或重命名）")
                 elif Path(f).suffix.lower() in PDF_EXTS:
@@ -268,11 +272,14 @@ class RecognitionWorker(QThread):
                 elif Path(f).suffix.lower() in IMAGE_EXTS and backend is not None:
                     parsed = recognize_image_gated(
                         backend, f, model_fn, self.threshold,
+                        force_model=self.force_model,
                     )
                 else:
                     parsed = _rec_fail("该文件类型在当前模式下不支持识别")
+                parsed["elapsed"] = round(time.perf_counter() - _t0, 3)
             except Exception as e:  # noqa: BLE001
                 parsed = _rec_fail(f"识别异常: {e}")
+                parsed["elapsed"] = round(time.perf_counter() - _t0, 3)
             parsed_list.append(parsed)
             self.progress.emit(i + 1, total)
 
@@ -835,6 +842,7 @@ class MainWindow(QMainWindow):
             "threshold": self.set_threshold.value(),
             "llm_kind": llm_kind, "llm_cfg": llm_cfg,
             "mode": mode, "vision_cfg": vision_cfg,
+            "force_model": self.text_force_model.isChecked(),
             "taobao_excel": tb_path or None,
             "prefix_date": self.set_prefix_date.isChecked(),
             "invoice_category": self.set_invoice_category.text(),
@@ -893,6 +901,7 @@ class MainWindow(QMainWindow):
             taobao_excel=params["taobao_excel"],
             prefix_date=params["prefix_date"],
             invoice_category=params["invoice_category"],
+            force_model=params["force_model"],
             hint_year=self._hint_year(),
         )
         self._rerun_worker.row_done.connect(self._on_rerun_row_done)
@@ -1043,6 +1052,7 @@ class MainWindow(QMainWindow):
             taobao_excel=params["taobao_excel"],
             prefix_date=params["prefix_date"],
             invoice_category=params["invoice_category"],
+            force_model=params["force_model"],
         )
         self._worker.row_done.connect(self._on_row_done)
         self._worker.progress.connect(self._on_progress)
@@ -1373,6 +1383,12 @@ class MainWindow(QMainWindow):
                 "reason": parsed.get("reason", ""),
                 "used_model": bool(parsed.get("used_model")),
                 "ocr_text": parsed.get("ocr_text", ""),
+                "model_raw": parsed.get("model_raw", ""),
+                "regex_result": parsed.get("regex_result"),
+                "elapsed": parsed.get("elapsed"),
+                # 模型两段结构化输出（仅 used_model 时有值）
+                "model_independent": parsed.get("model_independent"),
+                "model_final": parsed.get("model_final"),
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
             })
         with open(path, "w", encoding="utf-8") as fh:
@@ -1569,6 +1585,14 @@ class MainWindow(QMainWindow):
         self.ocr_prompt.textChanged.connect(
             lambda: self._auto_save("LLM 提示词已保存")
         )
+        self.text_force_model = QCheckBox(
+            "调试强制：每张图都走模型（不勾则 OCR 拿全就跳过；拼多多/美团仍会补全商品名）"
+        )
+        f.addRow(self.text_force_model)
+        self.text_force_model.toggled.connect(
+            lambda v: self._on_force_model_toggled(v)
+        )
+
         self._on_text_backend(self.text_backend.currentText())
         return w
 
@@ -1632,6 +1656,14 @@ class MainWindow(QMainWindow):
         self.vision_prompt.textChanged.connect(
             lambda: self._auto_save("视觉提示词已保存")
         )
+        self.vision_force_model = QCheckBox(
+            "调试强制：每张图都走模型（不勾则 OCR 拿全就跳过；拼多多/美团仍会补全商品名）"
+        )
+        f.addRow(self.vision_force_model)
+        self.vision_force_model.toggled.connect(
+            lambda v: self._on_force_model_toggled(v)
+        )
+
         self._on_vis_backend(self.vis_backend.currentText())
         return w
 
@@ -1640,6 +1672,20 @@ class MainWindow(QMainWindow):
         self.vision_local.setVisible(text == "本地")
         self.vision_cloud.setVisible(text == "云端")
         self._auto_save("视觉模型后端已切换并保存")
+
+    def _on_force_model_toggled(self, checked: bool):
+        """文字/视觉两个「强制模型」复选框共享同一配置，互相同步。"""
+        if getattr(self, "_suppress_force_toggle", False):
+            return
+        self._suppress_force_toggle = True
+        try:
+            if self.text_force_model.isChecked() != checked:
+                self.text_force_model.setChecked(checked)
+            if self.vision_force_model.isChecked() != checked:
+                self.vision_force_model.setChecked(checked)
+        finally:
+            self._suppress_force_toggle = False
+        self._auto_save("强制模型模式已更新")
 
     def _build_llm_config(self) -> tuple[str, dict]:
         """从文字模型 UI 收集 LLM 配置，返回 (kind, cfg_dict)。"""
@@ -1949,6 +1995,11 @@ class MainWindow(QMainWindow):
             self.vision_prompt.setPlainText(m["vision_local_prompt"])
         elif "vision_cloud_prompt" in m:
             self.vision_prompt.setPlainText(m["vision_cloud_prompt"])
+        if "force_model" in m:
+            self._suppress_force_toggle = True
+            self.text_force_model.setChecked(bool(m["force_model"]))
+            self.vision_force_model.setChecked(bool(m["force_model"]))
+            self._suppress_force_toggle = False
 
         # 自动重命名开关
         if "auto_rename" in s:
@@ -2007,6 +2058,7 @@ class MainWindow(QMainWindow):
                 # 模型提示词：公开可编辑、持久化（非敏感）
                 "ocr_prompt": self.ocr_prompt.toPlainText(),
                 "vision_prompt": self.vision_prompt.toPlainText(),
+                "force_model": self.text_force_model.isChecked(),
             },
         }
 

@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XM 报销 OCR 识别 + 大模型 · 系统架构设计文档</title>
+<style>
+  :root{
+    --ink:#2c3e50; --teal:#1abc9c; --teal-d:#16a085;
+    --orange:#e67e22; --purple:#8e44ad; --grey:#7f8c8d;
+    --line:#bdc3c7; --bg:#fafafa; --card:#ffffff; --soft:#ecf0f1;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:var(--ink);
+       background:var(--bg);line-height:1.6;}
+  .wrap{max-width:1240px;margin:0 auto;padding:32px 28px 80px;}
+  h1{font-size:28px;margin:0 0 6px;color:var(--ink);}
+  h2{font-size:21px;margin:42px 0 14px;padding-left:12px;border-left:5px solid var(--teal);}
+  h3{font-size:16px;margin:26px 0 8px;color:var(--teal-d);}
+  .sub{color:var(--grey);font-size:14px;margin:0 0 24px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;
+        padding:20px 24px;margin:16px 0;box-shadow:0 1px 3px rgba(0,0,0,.04);}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13.5px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:var(--soft);font-weight:600;}
+  code{background:var(--soft);padding:1px 6px;border-radius:4px;font-size:12.5px;
+       font-family:"Cascadia Code","Consolas",monospace;}
+  .tag{display:inline-block;background:var(--teal);color:#fff;border-radius:4px;
+       padding:1px 8px;font-size:12px;margin-right:4px;}
+  .tag.o{background:var(--orange);} .tag.p{background:var(--purple);}
+  .tag.g{background:var(--grey);}
+  .diagram{background:#fff;border:1px solid var(--line);border-radius:8px;
+           padding:14px;overflow-x:auto;margin:16px 0;}
+  .diagram svg{display:block;max-width:100%;height:auto;margin:0 auto;}
+  .note{font-size:12.5px;color:var(--grey);margin-top:6px;}
+  ul{margin:8px 0 8px 0;padding-left:22px;}
+  li{margin:4px 0;}
+  .kpi-row{display:flex;gap:14px;flex-wrap:wrap;margin:14px 0;}
+  .kpi{flex:1;min-width:150px;background:var(--card);border:1px solid var(--line);
+       border-radius:8px;padding:14px 16px;}
+  .kpi b{font-size:22px;color:var(--teal-d);display:block;}
+  .kpi span{font-size:12px;color:var(--grey);}
+  .flow-list{font-size:13.5px;}
+  .flow-list li{margin:8px 0;}
+  footer{margin-top:60px;color:var(--grey);font-size:12px;text-align:center;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>XM 报销 OCR 识别 + 大模型 · 系统架构设计文档</h1>
+<p class="sub">报销截图 / 发票 PDF 智能识别 → 自动重命名 → 报销导入 Excel 生成工具。版本快照基于 2026-07-14 代码状态。</p>
+
+<!-- ===================== 系统概述 ===================== -->
+<h2>一、系统概述与设计目标</h2>
+<div class="card">
+<p><b>产品定位：</b>面向个人 / 行政报销场景的桌面工具。输入为电商订单截图（淘宝 / 拼多多 / 美团）与增值税电子发票 PDF，输出为<strong>规范化重命名文件</strong> + <strong>可直接导入报销系统的消费明细 Excel</strong>。</p>
+<p><b>设计目标：</b></p>
+<ul>
+  <li><b>高准确率的字段抽取</b>：金额 / 平台 / 日期 / 商品名四要素为主，采用「OCR+正则前置 → 大模型兜底」的门控策略，正则能拿准的绝不调模型，兼顾成本与准确率。</li>
+  <li><b>零额外依赖的模型接入</b>：大模型后端仅用 Python 标准库 <code>urllib</code> 走 OpenAI 兼容协议，本地（LM Studio / Ollama）与云端（阿里云 MaaS 等）共用同一套代码，无需第三方 SDK。</li>
+  <li><b>UI 不阻塞</b>：所有重型识别（RapidOCR 推理、HTTP 调用）在 <code>QThread</code> 后台线程执行，GUI 始终可响应。</li>
+  <li><b>可分发</b>：PyInstaller onedir 打包，模型权重（ONNX）内置，大模型服务天然外部（HTTP），一键分发无模型负担。</li>
+  <li><b>配置驱动的模式路由</b>：5 种识别模式（OCR+正则 / 文字模型·本地 / 文字模型·云端 / 视觉模型·本地 / 视觉模型·云端）由 <code>config.json</code> 与 UI 单选卡驱动，运行时按 <code>model.mode</code> 动态装配后端。</li>
+</ul>
+</div>
+
+<div class="kpi-row">
+  <div class="kpi"><b>8</b><span>运行时 Python 模块（app/）</span></div>
+  <div class="kpi"><b>5</b><span>识别模式（门控路由）</span></div>
+  <div class="kpi"><b>3</b><span>核心处理引擎（OCR / 正则 / 大模型）</span></div>
+  <div class="kpi"><b>2</b><span>导出产物（订单汇总 / 报销导入）</span></div>
+</div>
+
+<!-- ===================== 技术栈 ===================== -->
+<h2>二、整体技术栈</h2>
+<table>
+  <tr><th>分层</th><th>技术 / 框架</th><th>说明</th></tr>
+  <tr><td>GUI 表示层</td><td>PyQt6（QtCore/QtGui/QtWidgets）</td><td>QMainWindow + QStackedWidget 三页切换；QTableWidget 结果表；QThread 异步识别</td></tr>
+  <tr><td>OCR 引擎</td><td>RapidOCR（rapidocr_onnxruntime + onnxruntime）</td><td>ONNX 推理，纯离线；经 <code>m1_poc.ocr_backend.OcrBackend</code> 封装</td></tr>
+  <tr><td>正则解析</td><td>标准库 <code>re</code></td><td><code>m1_poc.parser</code> + <code>order_fields.py</code>，平台特征词 / 金额 / 日期 / 商品名规则</td></tr>
+  <tr><td>大模型兜底</td><td>OpenAI 兼容 chat/completions（stdlib urllib）</td><td>文字模型 <code>OpenAICompatibleBackend</code> + 视觉模型 <code>VisionBackend</code></td></tr>
+  <tr><td>发票解析</td><td>PyMuPDF（fitz）</td><td>结构化文本 + 词块坐标法，绕过 OCR/模型</td></tr>
+  <tr><td>Excel 处理</td><td>openpyxl</td><td>淘宝订单读取匹配 + 报销导入写出 + 订单汇总</td></tr>
+  <tr><td>配置 / 打包</td><td>config.json / PyInstaller onedir</td><td>模式·端点·提示词·混淆密钥；LM Studio 外部 HTTP</td></tr>
+</table>
+
+<!-- ===================== 架构图 ===================== -->
+<h2>三、系统整体架构图</h2>
+<p class="note">分层：① 表示层 → ② 编排层 → ③ 处理引擎层 → ④ 导出层；右侧 ⑤ 为外部系统接口。箭头表示「调用 / 依赖 / 数据流向」。</p>
+<div class="diagram">
+<svg viewBox="0 0 1200 880" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#34495e"/>
+    </marker>
+    <marker id="aro" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#e67e22"/>
+    </marker>
+    <marker id="arp" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#8e44ad"/>
+    </marker>
+  </defs>
+
+  <!-- ===== Layer 1: 表示层 ===== -->
+  <text x="40" y="56" font-size="13" fill="#7f8c8d" font-weight="bold">① 表示层（GUI）</text>
+  <rect x="40" y="66" width="850" height="74" rx="8" fill="#2c3e50"/>
+  <text x="58" y="92" font-size="15" fill="#fff" font-weight="bold">main.py · MainWindow</text>
+  <text x="58" y="113" font-size="12.5" fill="#ecf0f1">三页：文件处理 / 模型选择 / 设置 ｜ RecognitionWorker（QThread 异步逐张识别）</text>
+  <text x="720" y="113" font-size="11.5" fill="#1abc9c" font-weight="bold">PyQt6</text>
+
+  <!-- ===== Layer 2: 编排层 ===== -->
+  <text x="40" y="176" font-size="13" fill="#7f8c8d" font-weight="bold">② 识别编排层（纯 Python，无 GUI 依赖）</text>
+  <rect x="40" y="186" width="850" height="74" rx="8" fill="#1abc9c"/>
+  <text x="58" y="212" font-size="15" fill="#fff" font-weight="bold">recognizer.py · 门控管线</text>
+  <text x="58" y="233" font-size="12.5" fill="#f4fffb">recognize_image_gated（OCR+正则前置→模型兜底）｜ recognize_vision ｜ render_template</text>
+  <text x="720" y="233" font-size="11.5" fill="#06584a" font-weight="bold">gated pipeline</text>
+
+  <!-- ===== Layer 3: 引擎层 ===== -->
+  <text x="40" y="296" font-size="13" fill="#7f8c8d" font-weight="bold">③ 处理引擎层</text>
+  <!-- OCR -->
+  <rect x="40" y="306" width="196" height="120" rx="8" fill="#34495e"/>
+  <text x="56" y="332" font-size="13.5" fill="#fff" font-weight="bold">OCR 引擎</text>
+  <text x="56" y="354" font-size="11.5" fill="#ecf0f1">m1_poc.ocr_backend</text>
+  <text x="56" y="372" font-size="11.5" fill="#ecf0f1">OcrBackend.recognize()</text>
+  <text x="56" y="408" font-size="10.5" fill="#1abc9c" font-weight="bold">RapidOCR / ONNX</text>
+  <!-- 正则 -->
+  <rect x="252" y="306" width="196" height="120" rx="8" fill="#34495e"/>
+  <text x="268" y="332" font-size="13.5" fill="#fff" font-weight="bold">正则解析</text>
+  <text x="268" y="354" font-size="11.5" fill="#ecf0f1">m1_poc.parser</text>
+  <text x="268" y="372" font-size="11.5" fill="#ecf0f1">+ order_fields.py</text>
+  <text x="268" y="408" font-size="10.5" fill="#1abc9c" font-weight="bold">re 金额/平台/日期/品名</text>
+  <!-- 大模型 -->
+  <rect x="464" y="306" width="244" height="120" rx="8" fill="#34495e"/>
+  <text x="480" y="332" font-size="13.5" fill="#fff" font-weight="bold">大模型兜底</text>
+  <text x="480" y="354" font-size="11.5" fill="#ecf0f1">llm_backend.py</text>
+  <text x="480" y="372" font-size="11.5" fill="#ecf0f1">OpenAICompatible(文字)</text>
+  <text x="480" y="390" font-size="11.5" fill="#ecf0f1">VisionBackend(视觉)</text>
+  <text x="480" y="414" font-size="10.5" fill="#1abc9c" font-weight="bold">OpenAI 兼容 HTTP</text>
+  <!-- 发票 -->
+  <rect x="724" y="306" width="166" height="120" rx="8" fill="#34495e"/>
+  <text x="740" y="332" font-size="13.5" fill="#fff" font-weight="bold">发票解析</text>
+  <text x="740" y="354" font-size="11.5" fill="#ecf0f1">invoice_parser.py</text>
+  <text x="740" y="372" font-size="11.5" fill="#ecf0f1">recognize_invoice</text>
+  <text x="740" y="408" font-size="10.5" fill="#1abc9c" font-weight="bold">PyMuPDF 坐标法</text>
+  <!-- 订单匹配 -->
+  <rect x="40" y="446" width="196" height="106" rx="8" fill="#5d6d7e"/>
+  <text x="56" y="472" font-size="13" fill="#fff" font-weight="bold">订单匹配</text>
+  <text x="56" y="494" font-size="11.5" fill="#ecf0f1">order_excel.py</text>
+  <text x="56" y="512" font-size="11.5" fill="#ecf0f1">load / match_by_*</text>
+  <text x="56" y="536" font-size="10.5" fill="#1abc9c" font-weight="bold">openpyxl</text>
+  <!-- 共享工具 -->
+  <rect x="252" y="446" width="196" height="106" rx="8" fill="#5d6d7e"/>
+  <text x="268" y="472" font-size="13" fill="#fff" font-weight="bold">Excel 共用</text>
+  <text x="268" y="494" font-size="11.5" fill="#ecf0f1">excel_utils.py</text>
+  <text x="268" y="512" font-size="11.5" fill="#ecf0f1">set_col_widths</text>
+  <text x="268" y="536" font-size="10.5" fill="#1abc9c" font-weight="bold">被导出模块共享</text>
+
+  <!-- ===== Layer 4: 导出层 ===== -->
+  <text x="40" y="586" font-size="13" fill="#7f8c8d" font-weight="bold">④ 导出层</text>
+  <rect x="40" y="596" width="430" height="74" rx="8" fill="#1abc9c"/>
+  <text x="58" y="622" font-size="14.5" fill="#fff" font-weight="bold">reimbursement_excel.py + order_excel.write_*</text>
+  <text x="58" y="644" font-size="12" fill="#f4fffb">报销导入 Excel（消费明细）｜ 订单汇总 Excel</text>
+
+  <!-- ===== Layer 5: 外部系统 ===== -->
+  <text x="918" y="56" font-size="13" fill="#7f8c8d" font-weight="bold">⑤ 外部系统接口</text>
+  <rect x="918" y="66" width="244" height="74" rx="8" fill="#7f8c8d"/>
+  <text x="934" y="92" font-size="13.5" fill="#fff" font-weight="bold">config.json</text>
+  <text x="934" y="113" font-size="11.5" fill="#ecf0f1">模式·端点·提示词·混淆密钥</text>
+
+  <rect x="918" y="306" width="244" height="120" rx="8" fill="#e67e22"/>
+  <text x="934" y="332" font-size="13.5" fill="#fff" font-weight="bold">大模型服务</text>
+  <text x="934" y="354" font-size="11.5" fill="#fff">LM Studio / Ollama</text>
+  <text x="934" y="372" font-size="11.5" fill="#fff">/ 云端 MaaS</text>
+  <text x="934" y="408" font-size="10.5" fill="#fff" font-weight="bold">chat/completions + /v1/models</text>
+
+  <rect x="918" y="446" width="244" height="106" rx="8" fill="#8e44ad"/>
+  <text x="934" y="472" font-size="13" fill="#fff" font-weight="bold">淘宝订单 Excel</text>
+  <text x="934" y="494" font-size="11.5" fill="#fff">本地文件（自动定位</text>
+  <text x="934" y="512" font-size="11.5" fill="#fff">"订单数据"命名）</text>
+  <text x="934" y="536" font-size="10.5" fill="#f5e6ff" font-weight="bold">按价格/商品名匹配</text>
+
+  <rect x="918" y="596" width="244" height="74" rx="8" fill="#8e44ad"/>
+  <text x="934" y="622" font-size="13.5" fill="#fff" font-weight="bold">报销导入模版.xlsx</text>
+  <text x="934" y="644" font-size="11.5" fill="#f5e6ff">本地文件（骨架复制）</text>
+
+  <rect x="918" y="700" width="244" height="60" rx="8" fill="#7f8c8d"/>
+  <text x="934" y="726" font-size="13" fill="#fff" font-weight="bold">logs/ (JSON)</text>
+  <text x="934" y="746" font-size="11" fill="#ecf0f1">识别日志 / 失败原因</text>
+
+  <!-- ===== Connectors ===== -->
+  <!-- UI -> 编排 -->
+  <line x1="465" y1="140" x2="465" y2="186" stroke="#34495e" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="476" y="168" font-size="10.5" fill="#34495e">start_recognition</text>
+  <!-- 编排 -> OCR/正则/大模型/发票 -->
+  <line x1="138" y1="260" x2="138" y2="306" stroke="#34495e" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="350" y1="260" x2="350" y2="306" stroke="#34495e" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="586" y1="260" x2="586" y2="306" stroke="#34495e" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="807" y1="260" x2="807" y2="306" stroke="#34495e" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="150" y="288" font-size="9.5" fill="#34495e">OCR+正则</text>
+  <!-- 大模型 -> 大模型服务 -->
+  <line x1="708" y1="366" x2="918" y2="366" stroke="#e67e22" stroke-width="2.5" marker-end="url(#aro)"/>
+  <text x="742" y="358" font-size="10" fill="#e67e22">HTTP 推理</text>
+  <!-- 订单匹配 -> 淘宝Excel -->
+  <line x1="236" y1="499" x2="918" y2="499" stroke="#8e44ad" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arp)"/>
+  <text x="560" y="491" font-size="10" fill="#8e44ad">读取+匹配</text>
+  <!-- 导出 -> 报销模版 -->
+  <line x1="470" y1="633" x2="918" y2="633" stroke="#8e44ad" stroke-width="2" marker-end="url(#arp)"/>
+  <text x="560" y="625" font-size="10" fill="#8e44ad">骨架复制</text>
+  <!-- UI -> config -->
+  <line x1="890" y1="103" x2="918" y2="103" stroke="#7f8c8d" stroke-width="2" marker-end="url(#ar)"/>
+  <!-- 导出/UI -> logs -->
+  <line x1="890" y1="660" x2="918" y2="720" stroke="#7f8c8d" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+  <text x="846" y="700" font-size="9.5" fill="#7f8c8d">写日志</text>
+  <!-- OCR/正则 供给 大模型 注释 omitted -->
+  <text x="40" y="772" font-size="11" fill="#7f8c8d">依赖关系：编排层依赖全部引擎；大模型兜底依赖③中 OCR 文本/原图作为输入；导出层依赖 order_excel / reimbursement_excel；所有模块通过 config.json 与⑤交互。</text>
+</svg>
+</div>
+
+<!-- ===================== 分层架构说明 ===================== -->
+<h2>四、分层架构与模块职责</h2>
+<table>
+  <tr><th>层级</th><th>模块</th><th>职责</th><th>关键接口</th><th>依赖</th></tr>
+  <tr>
+    <td>① 表示层</td><td><code>main.py</code><br>MainWindow / RecognitionWorker</td>
+    <td>三页 UI、结果表、KPI、文件选择、参数收集、触发识别/重命名/导出、后台线程调度</td>
+    <td><code>start_recognition()</code> · <code>_build_recognition_params()</code> · <code>_current_mode()</code> · <code>execute_rename()</code> · <code>export_*()</code> · <code>load_config()/save_config()</code></td>
+    <td>recognizer · llm_backend · order_excel · reimbursement_excel · invoice_parser（均懒加载）</td>
+  </tr>
+  <tr>
+    <td>② 编排层</td><td><code>recognizer.py</code></td>
+    <td>统一门控管线：OCR+正则前置，难图调模型兜底；视觉模式单图识别；文件名渲染</td>
+    <td><code>recognize_image_gated(backend, path, model_fn, threshold, force_model)</code> · <code>recognize_vision(path, vision_backend, regex_result)</code> · <code>render_template(tpl, amount, platform, ext)</code></td>
+    <td>m1_poc.parser · order_fields · llm_backend（model_fn）</td>
+  </tr>
+  <tr>
+    <td rowspan="4">③ 处理引擎层</td>
+    <td><code>m1_poc.ocr_backend</code></td>
+    <td>RapidOCR 封装，图片→OCR 文本（重模型，线程内懒加载）</td>
+    <td><code>OcrBackend().recognize(path) -&gt; str</code></td>
+    <td>rapidocr_onnxruntime</td>
+  </tr>
+  <tr>
+    <td><code>m1_poc.parser</code> + <code>order_fields.py</code></td>
+    <td>正则抽取金额/平台/日期/商品名；平台特征词判定；商品名质检黑名单</td>
+    <td><code>parse(text, threshold)</code> · <code>synthesize_confidence()</code> · <code>detect_platform()</code> · <code>extract_order_time()</code> · <code>extract_product_name()</code> · <code>normalize_date()</code> · <code>_is_bad_product()</code></td>
+    <td>标准库 re</td>
+  </tr>
+  <tr>
+    <td><code>llm_backend.py</code></td>
+    <td>大模型兜底（文字/视觉）；OpenAI 兼容 HTTP；提示词；JSON 容错解析；视觉时间归一</td>
+    <td><code>OpenAICompatibleBackend.parse(ocr_text, regex_result)</code> · <code>VisionBackend.parse_image(path, regex_result)</code> · <code>build_llm_backend(kind, cfg)</code> · <code>build_vision_backend(kind, cfg)</code> · <code>test_connection()</code></td>
+    <td>标准库 urllib / PIL（视觉压缩）</td>
+  </tr>
+  <tr>
+    <td><code>invoice_parser.py</code></td>
+    <td>发票 PDF 结构化解析（绕过 OCR/模型）：金额/日期/购销方/发票号/税目</td>
+    <td><code>recognize_invoice(pdf_path) -&gt; dict</code> · <code>render_invoice_name(parsed, category)</code></td>
+    <td>PyMuPDF</td>
+  </tr>
+  <tr>
+    <td rowspan="2">④ 导出层</td>
+    <td><code>order_excel.py</code></td>
+    <td>淘宝订单 Excel 读取、按价格/商品名匹配、订单汇总写出</td>
+    <td><code>load_taobao_excel()</code> · <code>match_by_price()</code> · <code>match_by_product()</code> · <code>build_order_rows()</code> · <code>write_order_excel()</code></td>
+    <td>openpyxl · order_fields</td>
+  </tr>
+  <tr>
+    <td><code>reimbursement_excel.py</code></td>
+    <td>由识别结果生成报销系统「消费明细导入」Excel（按固定模版骨架）</td>
+    <td><code>build_reimbursement_rows(results, files)</code> · <code>write_reimbursement_excel(tmpl, expense_type, rows, out)</code></td>
+    <td>openpyxl · excel_utils</td>
+  </tr>
+  <tr>
+    <td>共享</td><td><code>excel_utils.py</code></td>
+    <td>Excel 列宽设置（支持 &gt;26 列）</td>
+    <td><code>set_col_widths(ws, widths)</code></td>
+    <td>openpyxl</td>
+  </tr>
+</table>
+
+<!-- ===================== 数据流说明 ===================== -->
+<h2>五、数据流说明</h2>
+
+<h3>5.1 识别主流程（输入 → 解析 → 回填）</h3>
+<ol class="flow-list">
+  <li><b>扫描加载：</b>用户选文件夹 → <code>load_folder()</code> 按扩展名（<code>.jpg/.jpeg/.png/.pdf</code>）扫描文件 → 初始化 <code>results=[None]*N</code>、自动定位同目录「订单数据」Excel。</li>
+  <li><b>后台识别（RecognitionWorker.run，逐文件）：</b>
+    <ul>
+      <li>PDF → <code>recognize_invoice()</code>（PyMuPDF 结构化解析，<b>不进 OCR/模型管线</b>），输出 <code>{kind:"invoice", amount, date, seller, buyer, invoice_no, product}</code>。</li>
+      <li>图片 → <code>recognize_image_gated()</code>：
+        <ol>
+          <li>OCR 取文本 → <code>m1_poc.parser.parse()</code> 抽金额/平台 → <code>order_fields</code> 抽日期/商品名。</li>
+          <li><b>门控判定</b> <code>_need_model()</code>：status≠success，或（商品名空 且 平台≠淘宝）→ 调 <code>model_fn</code> 兜底（文字模型喂 OCR 文本 / 视觉模型喂原图）。</li>
+          <li>模型返回以「裁判」为主，正则仅作字段空缺兜底；淘宝商品名故意留空，交后期 Excel 匹配。</li>
+        </ol>
+      </li>
+    </ul>
+  </li>
+  <li><b>后期处理 <code>_postprocess()</code>（全 Python，不调模型）：</b>
+    <ol>
+      <li>发票字段归一：<code>platform←seller</code>、<code>order_time←date</code>、<code>product_name←product</code>、<code>invoice_count=1</code>。</li>
+      <li>主年份：取本批成功 <code>order_time</code> 中最新年份；<code>0000-MM-DD</code>（模型只读月日/年异常）→ 用主年份补全。</li>
+      <li>淘宝匹配：<code>match_by_product()</code>（商品名 LCS 相似度 ≥0.5）→ 失败则 <code>match_by_price()</code>（容差 5 元）兜底；用 Excel 的 订单时间/实付金额/完整商品名 覆盖识别结果。</li>
+      <li>四要素复查：图片失败行若四要素补全 → 翻回 success。</li>
+    </ol>
+  </li>
+  <li><b>文件名生成：</b>图片成功 → <code>render_template()</code>（或勾选时间前缀时 <code>{date}{platform}{amount}{ext}</code>）；发票 → <code>render_invoice_name()</code> = <code>{日期}-{金额}元-{销售方}-{类别}.pdf</code>。通过 <code>row_done</code> 信号回填表格。</li>
+</ol>
+
+<h3>5.2 重命名与导出（结果 → 产物）</h3>
+<ul class="flow-list">
+  <li><b>执行重命名：</b><code>execute_rename()</code> 按冲突策略（追加序号）批量重命名，记录 <code>last_renames</code> 支持撤销，写日志。</li>
+  <li><b>导出订单汇总：</b><code>build_order_rows()</code>（时间/商品名/价格/平台/原文件名）→ <code>write_order_excel()</code>。</li>
+  <li><b>导出报销导入：</b><code>build_reimbursement_rows()</code> 仅导出「成功且金额+日期齐全 + 图片商品名齐全」的条目，按模版骨架 <code>write_reimbursement_excel()</code> 生成消费明细（金额/消费日期/发票形式/发票/消费事由）。</li>
+</ul>
+
+<h3>5.3 统一识别结果契约（模块间数据格式）</h3>
+<table>
+  <tr><th>字段</th><th>图片（订单）</th><th>发票（PDF）</th><th>说明</th></tr>
+  <tr><td><code>status</code></td><td>success / failed</td><td>success / failed</td><td>四要素/三要素齐则成功</td></tr>
+  <tr><td><code>amount</code></td><td>实付金额</td><td>价税合计</td><td>float</td></tr>
+  <tr><td><code>platform</code></td><td>淘宝/拼多多/美团</td><td>← seller</td><td>平台或销售方</td></tr>
+  <tr><td><code>order_time</code></td><td>下单/期望时间</td><td>← date</td><td>yyyy-MM-dd</td></tr>
+  <tr><td><code>product_name</code></td><td>商品标题</td><td>← product（税目）</td><td>导出时语义不同</td></tr>
+  <tr><td><code>kind</code></td><td>（缺省=order）</td><td>"invoice"</td><td>GUI 分流依据</td></tr>
+  <tr><td>附加</td><td><code>ocr_text, used_llm, confidence, model_raw</code></td><td><code>buyer, invoice_no, category</code></td><td>日志/排查用</td></tr>
+</table>
+
+<!-- ===================== 数据流图 ===================== -->
+<h2>六、数据流图（DFD）</h2>
+
+<h3>6.1 识别与重命名主流程</h3>
+<p class="note">外部实体（橙）= 用户/外部系统；处理（青圆）= 进程；数据存储（开口矩形）= 持久态。</p>
+<div class="diagram">
+<svg viewBox="0 0 1180 540" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="d1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#2c3e50"/></marker>
+  </defs>
+
+  <!-- 外部实体 -->
+  <rect x="20" y="30" width="120" height="50" rx="6" fill="#e67e22"/>
+  <text x="80" y="55" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">用户</text>
+  <rect x="1040" y="30" width="120" height="50" rx="6" fill="#e67e22"/>
+  <text x="1100" y="52" font-size="13" fill="#fff" text-anchor="middle" font-weight="bold">大模型服务</text>
+  <text x="1100" y="70" font-size="10" fill="#fff" text-anchor="middle">LM Studio/云端</text>
+  <rect x="1040" y="430" width="120" height="50" rx="6" fill="#8e44ad"/>
+  <text x="1100" y="452" font-size="12.5" fill="#fff" text-anchor="middle" font-weight="bold">淘宝订单Excel</text>
+  <text x="1100" y="470" font-size="10" fill="#fff" text-anchor="middle">本地文件</text>
+
+  <!-- 数据存储 -->
+  <rect x="20" y="200" width="120" height="54" rx="4" fill="#fff" stroke="#7f8c8d" stroke-width="2"/>
+  <text x="80" y="222" font-size="12" fill="#2c3e50" text-anchor="middle" font-weight="bold">文件夹</text>
+  <text x="80" y="240" font-size="10.5" fill="#7f8c8d" text-anchor="middle">图片/PDF</text>
+  <rect x="20" y="320" width="120" height="54" rx="4" fill="#fff" stroke="#7f8c8d" stroke-width="2"/>
+  <text x="80" y="342" font-size="12" fill="#2c3e50" text-anchor="middle" font-weight="bold">results[]</text>
+  <text x="80" y="360" font-size="10.5" fill="#7f8c8d" text-anchor="middle">识别结果表</text>
+  <rect x="20" y="430" width="120" height="54" rx="4" fill="#fff" stroke="#7f8c8d" stroke-width="2"/>
+  <text x="80" y="452" font-size="12" fill="#2c3e50" text-anchor="middle" font-weight="bold">logs/</text>
+  <text x="80" y="470" font-size="10.5" fill="#7f8c8d" text-anchor="middle">JSON 日志</text>
+
+  <!-- 处理进程 -->
+  <circle cx="320" cy="90" r="46" fill="#1abc9c"/>
+  <text x="320" y="86" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">P1</text>
+  <text x="320" y="104" font-size="10.5" fill="#fff" text-anchor="middle">扫描加载</text>
+
+  <circle cx="600" cy="160" r="60" fill="#1abc9c"/>
+  <text x="600" y="154" font-size="15" fill="#fff" text-anchor="middle" font-weight="bold">P2</text>
+  <text x="600" y="174" font-size="10.5" fill="#fff" text-anchor="middle">逐图识别(门控)</text>
+
+  <circle cx="600" cy="340" r="58" fill="#1abc9c"/>
+  <text x="600" y="334" font-size="15" fill="#fff" text-anchor="middle" font-weight="bold">P3</text>
+  <text x="600" y="354" font-size="10" fill="#fff" text-anchor="middle">后期处理</text>
+
+  <circle cx="880" cy="250" r="50" fill="#1abc9c"/>
+  <text x="880" y="246" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">P4</text>
+  <text x="880" y="264" font-size="9.5" fill="#fff" text-anchor="middle">生成文件名</text>
+
+  <circle cx="330" cy="430" r="46" fill="#1abc9c"/>
+  <text x="330" y="426" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">P5</text>
+  <text x="330" y="444" font-size="10" fill="#fff" text-anchor="middle">执行重命名</text>
+
+  <!-- 数据流 -->
+  <line x1="140" y1="55" x2="274" y2="80" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="150" y="68" font-size="9.5" fill="#2c3e50">选文件夹</text>
+
+  <line x1="80" y1="254" x2="274" y2="110" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="120" y="175" font-size="9" fill="#2c3e50">文件列表</text>
+
+  <line x1="320" y1="136" x2="320" y2="340" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="328" y="245" font-size="9" fill="#2c3e50">逐图</text>
+
+  <line x1="366" y1="100" x2="544" y2="150" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="400" y="118" font-size="9" fill="#2c3e50">图片/PDF</text>
+
+  <line x1="660" y1="160" x2="1000" y2="70" stroke="#e67e22" stroke-width="2.5" marker-end="url(#d1)"/>
+  <text x="780" y="105" font-size="9.5" fill="#e67e22">OCR文本/原图→推理</text>
+  <line x1="1000" y1="80" x2="656" y2="178" stroke="#e67e22" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#d1)"/>
+  <text x="800" y="150" font-size="9" fill="#e67e22">识别结果</text>
+
+  <line x1="600" y1="220" x2="600" y2="282" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="608" y="255" font-size="9" fill="#2c3e50">parsed_list</text>
+
+  <line x1="720" y1="356" x2="1018" y2="452" stroke="#8e44ad" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#d1)"/>
+  <text x="760" y="420" font-size="9" fill="#8e44ad">订单行(匹配)</text>
+
+  <line x1="542" y1="356" x2="346" y2="404" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="400" y="395" font-size="9" fill="#2c3e50">回填</text>
+
+  <line x1="376" y1="340" x2="830" y2="262" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="560" y="300" font-size="9" fill="#2c3e50">四要素+年份</text>
+
+  <line x1="930" y1="250" x2="980" y2="200" stroke="#2c3e50" stroke-width="1.5" marker-end="url(#d1)"/>
+  <text x="936" y="222" font-size="8.5" fill="#2c3e50">新文件名</text>
+
+  <line x1="320" y1="374" x2="284" y2="430" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="220" y="410" font-size="9" fill="#2c3e50">确认执行</text>
+
+  <line x1="376" y1="430" x2="140" y2="450" stroke="#2c3e50" stroke-width="2" marker-end="url(#d1)"/>
+  <text x="200" y="448" font-size="9" fill="#2c3e50">重命名文件</text>
+
+  <line x1="330" y1="476" x2="140" y2="470" stroke="#7f8c8d" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#d1)"/>
+  <text x="200" y="492" font-size="9" fill="#7f8c8d">写日志</text>
+
+  <text x="20" y="525" font-size="10.5" fill="#7f8c8d">说明：P2 内部对图片走 OCR+正则门控（必要时调大模型），对 PDF 走结构化解析；P3 完成年份补全与淘宝 Excel 匹配后，P4 生成文件名并回填 results[]，P5 由用户触发实际重命名。</text>
+</svg>
+</div>
+
+<h3>6.2 报销 Excel 导出流程</h3>
+<div class="diagram">
+<svg viewBox="0 0 1180 300" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="d2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#2c3e50"/></marker>
+  </defs>
+  <rect x="20" y="110" width="120" height="54" rx="6" fill="#e67e22"/>
+  <text x="80" y="132" font-size="13" fill="#fff" text-anchor="middle" font-weight="bold">用户</text>
+  <text x="80" y="150" font-size="10" fill="#fff" text-anchor="middle">点导出</text>
+
+  <rect x="1010" y="30" width="140" height="54" rx="4" fill="#fff" stroke="#8e44ad" stroke-width="2"/>
+  <text x="1080" y="52" font-size="11.5" fill="#2c3e50" text-anchor="middle" font-weight="bold">报销导入模版</text>
+  <text x="1080" y="70" font-size="10" fill="#7f8c8d" text-anchor="middle">.xlsx 骨架</text>
+  <rect x="1010" y="190" width="140" height="54" rx="4" fill="#fff" stroke="#8e44ad" stroke-width="2"/>
+  <text x="1080" y="212" font-size="11.5" fill="#2c3e50" text-anchor="middle" font-weight="bold">订单汇总/</text>
+  <text x="1080" y="230" font-size="10" fill="#7f8c8d" text-anchor="middle">报销导入 Excel</text>
+
+  <circle cx="300" cy="137" r="52" fill="#1abc9c"/>
+  <text x="300" y="131" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">P6</text>
+  <text x="300" y="150" font-size="9.5" fill="#fff" text-anchor="middle">构造行</text>
+
+  <circle cx="620" cy="137" r="52" fill="#1abc9c"/>
+  <text x="620" y="131" font-size="14" fill="#fff" text-anchor="middle" font-weight="bold">P7</text>
+  <text x="620" y="150" font-size="9.5" fill="#fff" text-anchor="middle">写出 Excel</text>
+
+  <!-- results[] store -->
+  <rect x="160" y="240" width="120" height="44" rx="4" fill="#fff" stroke="#7f8c8d" stroke-width="2"/>
+  <text x="220" y="267" font-size="11" fill="#2c3e50" text-anchor="middle" font-weight="bold">results[]</text>
+
+  <line x1="140" y1="137" x2="248" y2="137" stroke="#2c3e50" stroke-width="2" marker-end="url(#d2)"/>
+  <text x="160" y="128" font-size="9" fill="#2c3e50">触发</text>
+  <line x1="220" y1="240" x2="270" y2="178" stroke="#2c3e50" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#d2)"/>
+  <text x="200" y="210" font-size="8.5" fill="#2c3e50">读取结果</text>
+  <line x1="352" y1="137" x2="568" y2="137" stroke="#2c3e50" stroke-width="2" marker-end="url(#d2)"/>
+  <text x="410" y="128" font-size="9" fill="#2c3e50">rows</text>
+  <line x1="672" y1="137" x2="1006" y2="80" stroke="#8e44ad" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#d2)"/>
+  <text x="780" y="100" font-size="9" fill="#8e44ad">复制骨架(Row1/3/4)</text>
+  <line x1="672" y1="150" x2="1006" y2="210" stroke="#2c3e50" stroke-width="2" marker-end="url(#d2)"/>
+  <text x="780" y="200" font-size="9" fill="#2c3e50">写入数据行</text>
+  <text x="20" y="290" font-size="10.5" fill="#7f8c8d">P6：build_reimbursement_rows / build_order_rows（过滤成功+必填齐全条目）；P7：write_reimbursement_excel（按模版骨架）/ write_order_excel，列宽由 excel_utils 统一设置。</text>
+</svg>
+</div>
+
+<!-- ===================== 关键技术决策 ===================== -->
+<h2>七、关键技术决策及其理由</h2>
+<table>
+  <tr><th>决策</th><th>方案</th><th>理由</th></tr>
+  <tr>
+    <td><b>门控识别（OCR+正则前置 → 模型兜底）</b></td>
+    <td>正则能拿准金额/平台/日期就直接用；仅「状态非 success」或「拼多多/美团商品名空」才调大模型</td>
+    <td>电商截图结构固定，正则准确率与速度远优于模型；大模型仅补缺，显著降低 token 成本与延迟，避免对每张图做昂贵推理</td>
+  </tr>
+  <tr>
+    <td><b>淘宝商品名交后期 Excel 匹配</b></td>
+    <td>门控阶段淘宝商品名故意留空，后期用 <code>match_by_product</code>（LCS）/ <code>match_by_price</code> 从订单 Excel 取完整名</td>
+    <td>视觉模型读出的商品名常过短/有偏差；Excel 中的完整标题更可靠，且能同时补回准确的时间与金额</td>
+  </tr>
+  <tr>
+    <td><b>大模型后端零依赖（stdlib urllib）</b></td>
+    <td>自实现 OpenAI 兼容 <code>chat/completions</code> 调用，不引入 requests/openai SDK</td>
+    <td>本地（LM Studio/Ollama）与云端协议一致；减小打包体积与依赖冲突面；便于 PyInstaller 分发</td>
+  </tr>
+  <tr>
+    <td><b>发票用结构化解析而非 OCR/模型</b></td>
+    <td><code>invoice_parser</code> 用 PyMuPDF 文本 + 词块坐标法定位金额/购销方/税目</td>
+    <td>电子发票是结构化文本 PDF，正则+坐标法 15 样本验证 100% 吻合；比截图 OCR 更稳、更快、零模型依赖</td>
+  </tr>
+  <tr>
+    <td><b>后台线程（QThread）承载识别</b></td>
+    <td>RecognitionWorker 在子线程跑 RapidOCR 加载/推理与 HTTP，信号回传 UI</td>
+    <td>RapidOCR 模型加载重、推理慢；避免阻塞 UI 导致「假死」；单图异常被 try 包裹不影响整体</td>
+  </tr>
+  <tr>
+    <td><b>统一识别结果契约（同构 dict）</b></td>
+    <td>图片与发票返回同结构 dict，<code>kind</code> 字段分流；导出归一 <code>platform←seller</code> 等</td>
+    <td>GUI 表格、重命名、导出共用一套渲染逻辑，消除图片/发票两套分支的维护成本</td>
+  </tr>
+  <tr>
+    <td><b>配置驱动的模式路由</b></td>
+    <td><code>_parse_mode_key</code> / <code>_current_mode</code> 归一 5 种模式；旧标识兼容</td>
+    <td>运行时按 <code>model.mode</code> 动态装配后端（含 <code>model_fn=None</code> 的纯正则档不加载任何模型），无需改代码即可切换能力</td>
+  </tr>
+  <tr>
+    <td><b>PyInstaller onedir + 外部大模型</b></td>
+    <td>exe 内置 ONNX 权重；LM Studio/GGUF 走 localhost HTTP，不入包</td>
+    <td>启动零解压、分发简单；模型权重更新不影响 exe；目标机单独装 LM Studio 即可换模型</td>
+  </tr>
+  <tr>
+    <td><b>API Key 混淆存储</b></td>
+    <td><code>_obf_encode/_obf_decode</code> 对 config.json 中密钥做轻量混淆</td>
+    <td>避免明文落盘密钥（非强加密，定位为「防一眼窥视」而非安全边界）</td>
+  </tr>
+</table>
+
+<!-- ===================== 配置与模式 ===================== -->
+<h2>八、配置与模式路由</h2>
+<p><code>config.json</code> 位于项目根（frozen 时与 exe 同级，首次运行自动生成空配置）。核心字段：</p>
+<table>
+  <tr><th>字段</th><th>取值</th><th>作用</th></tr>
+  <tr><td><code>model.mode</code></td><td>OCR+正则 / 文字模型·本地 / 文字模型·云端 / 视觉模型·本地 / 视觉模型·云端</td><td>驱动门控管线选择（纯正则 / 文字模型兜底 / 视觉模型兜底）</td></tr>
+  <tr><td><code>model.text_backend</code> / <code>vis_backend</code></td><td>本地 / 云端</td><td>文字/视觉模型后端下拉选择</td></tr>
+  <tr><td><code>ocr_local</code> / <code>ocr_cloud</code><br><code>vision_local</code> / <code>vision_cloud</code></td><td>endpoint / api_key / model</td><td>各后端的连接参数</td></tr>
+  <tr><td><code>model.ocr_prompt</code> / <code>vision_prompt</code></td><td>提示词（空→内置默认）</td><td>覆盖默认抽取提示词（含平台特征词与商品名剥离规则）</td></tr>
+  <tr><td><code>settings.*</code></td><td>template / threshold / taobao_excel / log_dir / invoice_category ...</td><td>命名模板、置信阈值、淘宝 Excel 路径、日志目录等</td></tr>
+</table>
+<p class="note">模式兼容性：旧标识（如「本地视觉模型」「OCR+文字模型」）由 <code>_parse_mode_key</code> 归一化；<code>llm_kind="正则判断"</code> 时 <code>build_llm_backend</code> 返回 None，等价于纯前端、不加载任何模型后端。</p>
+
+<footer>文档由代码静态分析生成 · 基于 2026-07-14 代码快照 · XM 报销 OCR 识别 + 大模型</footer>
+</div>
+</body>
+</html>

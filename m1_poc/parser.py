@@ -16,6 +16,14 @@ PLATFORM_RULES = [
     ("拼多多", ["拼小圈", "拼单时间", "成交时间", "先用后付"]),
 ]
 
+# 淘宝弱特征（辅助兜底）：仅当上面强特征全未命中时才生效。
+# 典型场景：淘宝「物流详情页」无「淘宝/天猫/交易快照」等强词，但含「支付宝支付」。
+# 作为弱特征可救活此类截图；又因排在强规则之后，拼多多/美团（含拼小圈/闪购等强词）
+# 即使用支付宝付款也会被强规则先命中，不会被误判为淘宝。
+PLATFORM_RULES_WEAK = [
+    ("淘宝", ["支付宝支付"]),
+]
+
 PLATFORM_WHITELIST = {"淘宝", "美团", "拼多多"}
 
 # 金额关键词分级：先取最终付款字段(实付款/实付总额)，再退化到(实付/合计)。
@@ -27,8 +35,16 @@ _NUM_RE = re.compile(r"¥?\s*(\d+(?:\.\d+)?)")
 
 
 def detect_platform(text: str):
-    """强制走正则，命中任一特征词即定平台；全未命中返回 None。"""
+    """强制走正则，命中任一特征词即定平台；全未命中返回 None。
+
+    强规则（PLATFORM_RULES）优先顺序命中；强规则全失效时再用弱规则
+    （PLATFORM_RULES_WEAK，如「支付宝支付」）兜底，避免辅助词抢判。
+    """
     for platform, keywords in PLATFORM_RULES:
+        for kw in keywords:
+            if kw in text:
+                return platform
+    for platform, keywords in PLATFORM_RULES_WEAK:
         for kw in keywords:
             if kw in text:
                 return platform
@@ -60,7 +76,10 @@ def _match_amount_after(text: str, keywords: list[str]):
                 return found
             # 后方没有，则向前方窗口兜底（如 ￥295v\n实付款）
             head = text[max(0, idx - 20): idx + len(kw)]
-            m = _NUM_RE.search(head)
+            # 优先带货币符号的金额，避免从规格文本「200个」抢到裸数字
+            m = re.search(r"[¥￥]\s*(\d+(?:\.\d+)?)", head)
+            if not m:
+                m = _NUM_RE.search(head)
             if m:
                 return float(m.group(1))
             idx = text.find(kw, idx + 1)

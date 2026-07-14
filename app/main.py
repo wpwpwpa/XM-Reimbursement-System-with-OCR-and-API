@@ -28,6 +28,26 @@ from PyQt6.QtWidgets import (
 from llm_backend import _OCR_PROMPT, _VISION_PROMPT  # noqa: E402
 
 
+# ── 表头排序键辅助函数 ──────────────────────────────────────
+import re as _re
+_NUM_IN_TEXT = _re.compile(r"[\d,]+(?:\.\d+)?")
+
+def _sort_key_amount(text: str):
+    """金额列排序：提取数字（含 ¥ 前缀），空值排最后。"""
+    m = _NUM_IN_TEXT.search(text.replace("¥", "").replace(",", "").strip())
+    return (0, float(m.group())) if m else (1, 0)
+
+def _sort_key_date(text: str):
+    """日期列排序（yyyy-MM-dd 格式字符串），空值排最后。"""
+    t = text.strip()
+    return (0, t) if t and len(t) >= 10 else (1, "")
+
+def _sort_key_text(text: str):
+    """通用文本列排序（大小写不敏感），空值排最后。"""
+    t = text.strip().lower()
+    return (0, t) if t else (1, "")
+
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 PDF_EXTS = {".pdf"}
 SUPPORTED_EXTS = IMAGE_EXTS | PDF_EXTS
@@ -547,6 +567,10 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         # 单击已选中的行 → toggle 取消选中（无 modifier 时连续点击同一行）
         self.table.cellClicked.connect(self._on_table_cell_clicked)
+        # 点击表头排序
+        self.table.horizontalHeader().sectionClicked.connect(self._on_header_sort)
+        self._sort_col = -1          # 当前排序列（-1=未排序）
+        self._sort_asc = True         # 当前方向（True=升序↑, False=降序↓）
         v.addWidget(self.table, 1)
 
         # 底部：导出按钮 + 状态
@@ -1124,6 +1148,46 @@ class MainWindow(QMainWindow):
         cell = QTableWidgetItem(f"✗ {text}")
         cell.setForeground(QBrush(QColor("#e74c3c")))
         self.table.setItem(row, COL_STATUS, cell)
+
+    # ── 表头排序 ──────────────────────────────────────────────
+
+    def _on_header_sort(self, col: int) -> None:
+        """点击表头：升序↔降序循环切换，按列排序表格行（纯视觉重排）。"""
+        if self.table.rowCount() == 0:
+            return
+        # 同一列 → 切换方向；不同列 → 默认升序
+        if col == self._sort_col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+        # 收集每行的排序键
+        rows = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, col)
+            txt = item.text().strip() if item else ""
+            rows.append((txt, r))
+        # 按列类型选比较策略：金额列提取数字，其余按文本/日期字符串
+        if col == COL_AMOUNT:
+            key_fn = _sort_key_amount
+        elif col == COL_DATE:
+            key_fn = _sort_key_date
+        else:
+            key_fn = _sort_key_text
+        rows.sort(key=lambda x: key_fn(x[0]), reverse=not self._sort_asc)
+        # 重排行顺序（只动显示行，不碰 self.results / self.files）
+        order = [r for _, r in rows]
+        self.table.verticalHeader().setSectionsMovable(True)
+        vh = self.table.verticalHeader()
+        for new_idx, old_row in enumerate(order):
+            vh.moveSection(vh.visualIndex(old_row), new_idx)
+        vh.setSectionsMovable(False)
+        # 更新表头箭头指示
+        header = self.table.horizontalHeader()
+        header.setSortIndicator(col,
+            Qt.SortOrder.AscendingOrder if self._sort_asc else Qt.SortOrder.DescendingOrder)
+        header.setSortIndicatorShown(True)
+        header.setSectionsClickable(True)
 
     def execute_rename(self):
         # 函数内导入，避免模块级触发重型模块加载

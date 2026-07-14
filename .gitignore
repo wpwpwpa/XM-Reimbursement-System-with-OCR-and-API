@@ -33,3 +33,4 @@ xref-*.html
 *.exe
 *.dll
 *.pyd
+build_backup_*/

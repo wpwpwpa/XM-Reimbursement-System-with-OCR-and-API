@@ -26,6 +26,13 @@ from excel_utils import set_col_widths
 
 import warnings
 
+# 已知电商/平台关键词：发票的 platform 默认是开票公司名（销售方），
+# 不应直接进「消费事由」；仅当 platform 是这些已知平台名时才用，否则兜底"平台"。
+_PLATFORM_KEYWORDS = frozenset({
+    "淘宝平台", "淘宝", "天猫", "京东", "京东平台", "拼多多", "美团",
+    "唯品会", "苏宁", "当当", "国美", "抖音", "快手小店", "京东商城",
+})
+
 
 def _build_reason(order_time: str | None, platform: str,
                   product: str | None, amount) -> str:
@@ -81,9 +88,12 @@ def build_reimbursement_rows(results, files) -> list[dict]:
         # 图片需商品名齐全；发票商品名为税目分类，不强制
         if parsed.get("kind") != "invoice" and not parsed.get("product_name"):
             continue  # 图片缺商品名 → 跳过不导出
-        # 发票行：消费事由不填开票公司名，用固定「平台」占位
+        # 发票行：默认不把开票公司名当平台（用「平台」占位）；
+        # 仅当 platform 是已知电商关键词（如匹配到的"淘宝平台"）时才用。
         if parsed.get("kind") == "invoice":
-            plat = "平台"
+            plat = parsed.get("platform") or "平台"
+            if plat not in _PLATFORM_KEYWORDS:
+                plat = "平台"
         else:
             plat = parsed.get("platform") or ""
         rows.append({

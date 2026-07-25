@@ -21,6 +21,34 @@ _DATE_DASH_RE = re.compile(r"(?<!\d)(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?!\d)")
 _INVOICE_NO_RE = re.compile(r"\b(\d{20})\b")
 _PRODUCT_RE = re.compile(r"\*[^*]+\*")  # 税收分类：*蔬菜* / *日用杂品*
 
+# ── 发票照片检测（图片无扩展名可区分，靠 OCR 文本关键词判定）──
+_INVOICE_STRONG = ("价税合计", "增值税", "发票号码", "纳税人识别号",
+                   "统一社会信用代码", "税额", "购买方", "销售方")
+# 订单平台标记：命中则优先归订单（避免发票/订单误判）
+_INVOICE_ORDER_MARKERS = ("淘宝", "拼多多", "美团", "京东")
+# 京东特有支付/物流特征：用户明确「银行卡/白条支付即京东」；
+# 京东截图常含「发票类型 不开发票」，必须把支付方式作为订单强信号先排除。
+_JD_ORDER_MARKERS = ("白条", "银行卡支付", "京东快递", "京喜自营")
+
+
+def looks_like_invoice(text: str) -> bool:
+    """根据 OCR 文本判断图片是否为发票（照片）。
+
+    命中京东支付/物流特征 → 直接归订单；
+    命中任一发票强特征 → 发票；
+    含「发票」且不含订单平台特征 → 发票；
+    否则归订单（沿用现有行为）。启发式，极端 OCR 全漏时可能误判。
+    """
+    t = text or ""
+    # 京东截图常带「不开发票」字样，先用支付方式/物流特征强排
+    if any(k in t for k in _JD_ORDER_MARKERS):
+        return False
+    if any(k in t for k in _INVOICE_STRONG):
+        return True
+    if "发票" in t and not any(o in t for o in _INVOICE_ORDER_MARKERS):
+        return True
+    return False
+
 
 def _to_ymd(y, mo, d) -> str | None:
     """把年/月/日组成本地化 YYYY-MM-DD；任一非数字则 None。"""
@@ -120,6 +148,10 @@ def _extract_parties(words: list) -> tuple[str | None, str | None]:
 
     name_labels = [w for w in words if _is_name_label(w[4].strip())]
     _SKIP = ("：", ":", "）", ")", "（", "(", "")
+    # 销售方区块里这些标签之后的内容不是公司名（信用代码/税号/地址等），
+    # 提取时一律排除；若仍混入，拼接后按首个标签截断。
+    _STOP = ("统一社会信用代码", "纳税人识别号", "地址", "电话",
+             "开户行", "银行账号", "账号", "开户银行", "备注")
 
     seller = buyer = None
     for nw in name_labels:
@@ -128,6 +160,7 @@ def _extract_parties(words: list) -> tuple[str | None, str | None]:
             w for w in words
             if abs(w[1] - nw[1]) <= 4 and w[0] > nw[0] + 1
             and w[4].strip() not in _SKIP
+            and not any(k in w[4] for k in _STOP)
         ]
         if not right:
             # 同列下方第一行（上下布局，如京东）
@@ -136,6 +169,7 @@ def _extract_parties(words: list) -> tuple[str | None, str | None]:
                 w for w in words
                 if w[1] > nw[3] and abs((w[0] + w[2]) / 2 - col_c) <= 60
                 and w[4].strip() not in _SKIP
+                and not any(k in w[4] for k in _STOP)
             ]
             if below:
                 below.sort(key=lambda w: w[1])
@@ -145,6 +179,11 @@ def _extract_parties(words: list) -> tuple[str | None, str | None]:
                     key=lambda w: w[0],
                 )
         company = "".join(w[4] for w in right).strip(" ：:（）()")
+        # 二次保险：若仍混入信用代码/税号等标签，截断到首个标签前
+        for k in _STOP:
+            idx = company.find(k)
+            if idx != -1:
+                company = company[:idx].strip(" ：:（）()")
         if not company:
             continue
         if seller_title and buyer_title:
@@ -168,31 +207,50 @@ def _extract_parties(words: list) -> tuple[str | None, str | None]:
     return seller, buyer
 
 
-def _extract_seller_by_text(text: str) -> str | None:
-    """坐标法失败时的文本兜底：从销售方区块提取公司名称。
+def _extract_party_block(text: str, labels: tuple[str, ...]) -> str | None:
+    """从指定区块（如「销售方信息/销售方」）提取第一个「名称：xxx」。
 
-    兼容竖排标签（'销售方'→'销\\n售\\n方'，'名称'→'名 称'），
-    且允许「名称:」与公司名跨行（中间隔信用代码等行）。
+    兼容 OCR 把「信息」「名称」拆成多字或带空格的情况，也兼容个体工商户
+    无「有限公司/公司」后缀的店名。
     """
-    # 竖排标签还原
-    norm = re.sub(r"销\s*售\s*方", "销售方", text)
+    norm = re.sub(r"信\s*息", "信息", text)
     norm = re.sub(r"名\s*称", "名称", norm)
 
-    # 1) 销售方区块内「名称」后的公司名（非贪婪跳过中间行，捕获含公司后缀的行）
-    m = re.search(
-        r"销售方.*?名称[:：]\s*((?:[^\n]*\n)*?)([^\n]*(?:有限公司|公司|集团|股份)[^\n]*)",
-        norm, re.DOTALL,
-    )
-    if m:
-        return m.group(2).strip(" ：:（）()")
+    for label in labels:
+        # 从 label 出现处到第一个「名称：...」行，非贪婪、按行结束
+        m = re.search(
+            re.escape(label) + r".*?名称[:：]?\s*([^\n]+?)(?:\n|$)",
+            norm, re.DOTALL,
+        )
+        if not m:
+            continue
+        name = m.group(1).strip(" ：:")
+        # 若 OCR 把下一行标签粘进来，截断到首个标签前
+        for k in ("统一社会信用代码", "纳税人识别号", "地址", "电话",
+                  "开户行", "银行账号"):
+            idx = name.find(k)
+            if idx != -1:
+                name = name[:idx].strip(" ：:")
+        if name:
+            return name
+    return None
 
-    # 2) 兜底：全文第一个「名称」后的公司名
-    m2 = re.search(
-        r"名称[:：]\s*((?:[^\n]*\n)*?)([^\n]*(?:有限公司|公司|集团|股份)[^\n]*)",
-        norm, re.DOTALL,
-    )
-    if m2:
-        return m2.group(2).strip(" ：:（）()")
+
+def _extract_seller_by_text(text: str) -> str | None:
+    """坐标法失败时的文本兜底：优先从「销售方信息/销售方」区块提取名称。
+
+    兼容个体工商户等无「有限公司」后缀的卖家名；无销售方区块时退化为
+    全文第一个含公司后缀的「名称」。
+    """
+    name = _extract_party_block(text, ("销售方信息", "销售方"))
+    if name:
+        return name
+
+    # 兜底：全文第一个含公司后缀的「名称」
+    norm = re.sub(r"名\s*称", "名称", text)
+    m = re.search(r"名称[:：]?\s*([^\n]*(?:有限公司|公司|集团|股份)[^\n]*)", norm)
+    if m:
+        return m.group(1).strip(" ：:")
     return None
 
 
@@ -307,11 +365,81 @@ def recognize_invoice(pdf_path: str) -> dict:
     }
 
 
-def render_invoice_name(parsed: dict, category: str = "发票") -> str:
-    """生成发票新文件名：{日期}-{金额}元-{销售方}-{类别}.pdf"""
+def render_invoice_name(parsed: dict, category: str = "发票", ext: str = ".pdf") -> str:
+    """生成发票新文件名：{日期}-{类别}-{金额}元{ext}。
+
+    按用户约定「时间-发票-价格」格式，不再把销售方塞进文件名。
+    ext：目标扩展名。PDF 发票默认 .pdf；发票照片需传入原图扩展名(.jpg/.png)，
+    避免把照片改名成 .pdf 后缀。
+    """
     date = parsed.get("date") or "0000-00-00"
     amount = parsed.get("amount")
     amt = f"{amount:.2f}" if isinstance(amount, (int, float)) else str(amount)
-    seller = parsed.get("seller") or "未知销售方"
     cat = category or "发票"
-    return f"{date}-{amt}元-{seller}-{cat}.pdf"
+    return f"{date}-{cat}-{amt}元{ext}"
+
+
+def _extract_buyer_by_text(text: str) -> str | None:
+    """坐标法不可用时的文本兜底：从「购买方信息/购买方」区块提取公司/个人名。"""
+    return _extract_party_block(text, ("购买方信息", "购买方"))
+
+
+def _invoice_img_fail(reason: str) -> dict:
+    return {
+        "status": "failed", "kind": "invoice", "amount": None, "date": None,
+        "seller": None, "buyer": None, "invoice_no": None, "product": None,
+        "category": "发票", "confidence": 0.0, "reason": reason, "ocr_text": "",
+    }
+
+
+def recognize_invoice_image(image_path: str, backend=None,
+                            ocr_text: str | None = None) -> dict:
+    """识别单张发票照片（图片），返回与 PDF 发票同构的 dict（kind="invoice"）。
+
+    策略：RapidOCR 取文本 → 复用 PDF 发票正则引擎（金额/日期/发票号/税目/销售方）。
+    图片无 PyMuPDF 坐标词块，销售方/购买方退化为文本兜底。
+    backend/ocr_text：至少其一；优先用传入的 ocr_text 避免重复 OCR。
+    """
+    text = ocr_text
+    if text is None:
+        if backend is None:
+            return _invoice_img_fail("未提供 OCR 后端或文本")
+        try:
+            text = backend.recognize(image_path)
+        except Exception as e:  # noqa: BLE001
+            return _invoice_img_fail(f"OCR 失败: {e}")
+    text = text or ""
+
+    amount = _extract_amount(text)
+    date = _norm_date(_DATE_CN_RE.search(text), _DATE_DASH_RE.search(text))
+    m = _INVOICE_NO_RE.search(text)
+    invoice_no = m.group(1) if m else None
+    if not invoice_no:
+        m = re.search(r"发票号码[:：]?\s*(\d{8,20})", text)
+        invoice_no = m.group(1) if m else None
+    seller = _extract_seller_by_text(text)
+    buyer = _extract_buyer_by_text(text)
+    product = None
+    m = _PRODUCT_RE.search(text)
+    if m:
+        product = m.group(0)
+    if not product:
+        mp = re.search(r"项目名称[:：]?\s*([^\n]{2,40})", text)
+        if mp:
+            product = mp.group(1).strip()
+
+    core = [amount, date, seller]
+    if all(core):
+        status, confidence, reason = "success", 0.95, ""
+    else:
+        missing = [n for n, v in zip(("金额", "日期", "销售方"), core) if not v]
+        status = "failed"
+        confidence = 0.0 if not any(core) else 0.6
+        reason = "缺失字段：" + "、".join(missing)
+
+    return {
+        "status": status, "kind": "invoice", "amount": amount, "date": date,
+        "seller": seller, "buyer": buyer, "invoice_no": invoice_no,
+        "product": product, "category": "发票", "confidence": confidence,
+        "reason": reason, "ocr_text": text,
+    }

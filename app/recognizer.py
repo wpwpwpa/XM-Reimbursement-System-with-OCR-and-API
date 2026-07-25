@@ -93,7 +93,8 @@ def _need_model(result: dict) -> bool:
 
 def recognize_image_gated(backend, image_path, model_fn=None,
                           threshold: float = DEFAULT_THRESHOLD,
-                          force_model: bool = False) -> dict:
+                          force_model: bool = False,
+                          text: str | None = None) -> dict:
     """门控识别（方案A：简化）：OCR+正则前置拿金额/平台/时间；拼多多/美团配了模型
     则直接调模型判断商品名，不再先抽正则候选对比、不再二次仲裁。
 
@@ -113,18 +114,19 @@ def recognize_image_gated(backend, image_path, model_fn=None,
     """
     from m1_poc.parser import parse, synthesize_confidence
 
-    text = ""
-    if backend is not None:
-        try:
-            text = backend.recognize(image_path)
-        except Exception:  # noqa: BLE001
-            text = ""
+    if text is None:
+        text = ""
+        if backend is not None:
+            try:
+                text = backend.recognize(image_path)
+            except Exception:  # noqa: BLE001
+                text = ""
 
     result = parse(text, threshold)          # 正则：金额 + 平台
     result["ocr_text"] = text                 # 透传 OCR 原文，供日志/后台验证
     platform = result.get("platform")
-    # 拼多多/美团 可从文本正则抽时间；淘宝留空待 Excel
-    time_img = extract_order_time(text, platform) if platform in ("拼多多", "美团") else None
+    # 拼多多/美团/京东 可从文本正则抽时间；淘宝留空待 Excel
+    time_img = extract_order_time(text, platform) if platform in ("拼多多", "美团", "京东") else None
     # 商品名：正则抽取（所有平台均尝试；模型档下优先模型）
     product = extract_product_name(text, platform)
     if product and _is_bad_product(product):   # 质检：垃圾值视为空

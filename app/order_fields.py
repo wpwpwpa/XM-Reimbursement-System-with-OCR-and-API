@@ -16,6 +16,7 @@ _DATE_SHORT_RE = re.compile(r"(?:^|[^0-9])(\d{1,2})[月](\d{1,2})[日]")
 TIME_KEYWORD = {
     "拼多多": ["下单时间"],
     "美团": ["下单时间", "支付时间", "期望时间"],
+    "京东": ["支付时间", "下单时间"],
 }
 
 # 商品名标签（按优先级）；命中其一即取其后文本。
@@ -77,7 +78,7 @@ def _find_after_keyword(text: str, keyword: str, window: int = 40) -> str:
 
 
 def extract_order_time(text: str, platform: str | None) -> str | None:
-    """按平台取下单/期望时间，归一化为 yyyy-MM-dd。淘宝返回 None。"""
+    """按平台取下单/支付/期望时间，归一化为 yyyy-MM-dd。淘宝返回 None。"""
     if not platform or platform not in TIME_KEYWORD:
         return None
     for keyword in TIME_KEYWORD[platform]:
@@ -344,17 +345,59 @@ def _extract_by_price_anchor(lines, platform):
     return name if name and not _is_bad_product(name) else None
 
 
+def _extract_jd_product(lines) -> str | None:
+    """京东专用：以「到手」或首个带货币符号的价格行为锚点，向上取首个商品行。
+
+    京东商品区结构固定：店铺行 → 商品名（1~2 行） → 到手￥XX → ¥原价 → 规格行。
+    锚点用「到手」最稳；若 OCR 漏掉「到手」则用首个 ¥数字 价格行兜底。
+    只向上取一行商品标题，不向下扩展（避免把规格/数量拼进来）。
+    """
+    anchor = None
+    for i, ln in enumerate(lines):
+        if "到手" in ln and re.search(r"[￥¥]\s*\d", ln):
+            anchor = i
+            break
+    if anchor is None:
+        # 兜底：首个带货币符号的价格行
+        for i, ln in enumerate(lines):
+            if ("￥" in ln or "¥" in ln) and re.search(r"[￥¥]\s*\d", ln):
+                anchor = i
+                break
+    if anchor is None:
+        return None
+
+    # 向上回溯：找锚点上方第一个像商品名的非噪声行
+    for i in range(anchor - 1, -1, -1):
+        candidate = lines[i].strip()
+        if not candidate:
+            continue
+        if _line_is_noise(candidate):
+            continue
+        # 清理常见前缀（①到手 / 到手 / ① 等营销角标）
+        cleaned = re.sub(r"^[①②③④⑤⑥⑦⑧⑨⑩]\s*", "", candidate)
+        cleaned = cleaned.strip()
+        if not cleaned or len(cleaned) < 4:
+            continue
+        if not _looks_like_product(cleaned):
+            continue
+        cleaned = _strip_spec(cleaned)
+        if cleaned and not _is_bad_product(cleaned):
+            return cleaned
+    return None
+
+
 def extract_product_name(text: str, platform: str | None) -> str | None:
-    """从 OCR 文本抽商品名（支持拼多多/美团/淘宝）。
+    """从 OCR 文本抽商品名（支持拼多多/美团/淘宝/京东）。
 
     策略：
     1) PRODUCT_LABELS 优先（订单含「商品名称/宝贝标题」等标签时直接取其后文本）。
     2) 标签缺失时兜底：金额锚点法——商品名 = 夹在噪声结构之间的纯文本段。
        - 美团/淘宝：首个「实付￥」为终点，向上回溯跳过店/群/状态到首个商品行。
        - 拼多多：首个「￥数字」为主行，向上回溯到首个商品行、向下取续行。
+       - 京东：以「到手」或首个价格行为锚点，向上取首个商品行。
     3) 含「约」生鲜重量估算兜底（仅美团）。
     """
-    if not platform or platform not in ("拼多多", "美团", "淘宝"):
+    if not platform or platform not in ("拼多多", "美团", "淘宝", "京东"):
         return None
     lines = _lines(text)
     if not lines:
@@ -370,6 +413,12 @@ def extract_product_name(text: str, platform: str | None) -> str | None:
         by_shop = _extract_below_taobao_shop(lines)
         if by_shop:
             return by_shop
+
+    # 1.6) 京东专用：到手价锚点
+    if platform == "京东":
+        by_jd = _extract_jd_product(lines)
+        if by_jd:
+            return by_jd
 
     # 2) 金额锚点兜底
     by_anchor = _extract_by_price_anchor(lines, platform)

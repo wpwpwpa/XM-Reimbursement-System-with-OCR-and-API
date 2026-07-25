@@ -26,6 +26,10 @@ COLUMN_ALIASES = {
 
 PRICE_TOLERANCE = 5.0  # 价格匹配容差（元）；视觉模型金额识别常有 0.x~数元偏差
 
+# 发票「商品名称」可能是税目分类（如 *日用杂品* / *蔬菜*），并非真实品名；
+# 这类值无法与 Excel 真实商品名做相似度比对，需识别后降级为「仅价格」匹配。
+_TAX_RE = re.compile(r"^\*[^*]+\*$")
+
 
 def _match_header(headers, keywords):
     """返回命中关键词最长的列索引（精确词如"实付金额"优先于泛词"金额"）；
@@ -148,6 +152,52 @@ def match_by_product(excel_data: dict, product_name: str | None, ratio_thresh: f
     scored.sort(key=lambda x: x[0], reverse=True)
     ambiguous = len(scored) > 1 and (scored[0][0] - scored[1][0]) < 0.15
     return scored[0][1], ambiguous
+
+
+def match_invoice(excel_data: dict, amount, product, name_thresh: float = 0.5):
+    """发票(PDF) ↔ 淘宝订单Excel 匹配：精确价格为主、商品名软确认（无容差）。
+
+    返回 (row_dict_or_None, ambiguous: bool, detail: str)。
+    算法：
+    - 先用发票「价税合计」在 Excel「实付金额」做**精确**匹配（按 2 位小数对齐，
+      零容差——不同价（哪怕差 0.01 元）一律不命中；按 2 位小数比较以免疫浮点误差）；
+    - 发票商品名若为真实品名（非 *税目*、非空、>=2字），用相似度二次确认
+      （双向包含或 LCS 最长公共子串比，>= name_thresh 才计入）；
+    - 若发票商品名是税目分类或缺，则退化为「仅价格优先」；
+    - 同价多行（精确同价）→ ambiguous=True（提示人工核对，靠商品名区分）。
+    """
+    amt = amount if isinstance(amount, (int, float)) else None
+    if amt is None:
+        return None, False, "发票金额缺失"
+    a = round(float(amt), 2)   # 精确 2 位小数，无容差
+    cands = [(abs(round(r["price"], 2) - a), r) for r in excel_data["rows"]
+             if r["price"] is not None
+             and round(r["price"], 2) == a]
+    if not cands:
+        return None, False, "价格未命中Excel(精确匹配)"
+    cands.sort(key=lambda x: x[0])
+
+    pn = (product or "").strip()
+    is_real = bool(pn) and not _TAX_RE.match(pn) and len(pn) >= 2
+    if is_real:
+        scored = []
+        for _diff, r in cands:
+            en = (r.get("product") or "").strip()
+            if not en:
+                continue
+            score = 1.0 if (pn in en or en in pn) else _lcs_ratio(pn, en)
+            if score >= name_thresh:
+                scored.append((score, r))
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            best = scored[0][1]
+            amb = len(scored) > 1 and (scored[0][0] - scored[1][0]) < 0.15
+            return best, amb, "价格+商品名"
+        # 有真实品名但都与 Excel 不相似 → 仍按价格取该行，标人工核对
+        return cands[0][1], True, "价格命中·商品名不相似"
+    # 纯税目 / 无可用品名 → 只能靠价格
+    amb = len(cands) > 1
+    return cands[0][1], amb, "价格命中(无可用品名)"
 
 
 def build_order_rows(results, files) -> list[dict]:

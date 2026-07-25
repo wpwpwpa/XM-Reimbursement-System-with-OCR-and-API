@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import time
+import hashlib
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QBrush
@@ -159,7 +160,7 @@ class RecognitionWorker(QThread):
     row_done 携带完整 parsed dict（含 confidence / used_llm），供重命名/日志复用。
     """
 
-    row_done = pyqtSignal(int, dict, str)   # row, parsed, new_name
+    row_done = pyqtSignal(str, dict, str)   # path, parsed, new_name（按路径身份回填，杜绝下标错位）
     progress = pyqtSignal(int, int)          # current, total
     finished = pyqtSignal(int, int)          # recognized, failed
     warn = pyqtSignal(str)                   # 非致命提示（Excel 匹配等）
@@ -216,7 +217,12 @@ class RecognitionWorker(QThread):
         else:
             # PDF-only 模式：不需 OCR/模型后端，但需要新文件名生成
             from recognizer import render_template
-        from invoice_parser import recognize_invoice, render_invoice_name
+        from invoice_parser import (
+            recognize_invoice,
+            recognize_invoice_image,
+            render_invoice_name,
+            looks_like_invoice,
+        )
         is_vision = "视觉" in mode
         is_text = (not is_vision) and (
             mode.startswith("文字模型") or mode == "OCR+文字模型"
@@ -270,10 +276,15 @@ class RecognitionWorker(QThread):
                 elif Path(f).suffix.lower() in PDF_EXTS:
                     parsed = recognize_invoice(f)   # 发票：结构化解析，不依赖 OCR/模型
                 elif Path(f).suffix.lower() in IMAGE_EXTS and backend is not None:
-                    parsed = recognize_image_gated(
-                        backend, f, model_fn, self.threshold,
-                        force_model=self.force_model,
-                    )
+                    ocr_text = backend.recognize(f)   # 先 OCR 一次，用于发票/订单判定
+                    if looks_like_invoice(ocr_text):
+                        # 发票照片：走发票正则提取（金额/日期/销售方等），不误当订单
+                        parsed = recognize_invoice_image(f, backend, ocr_text)
+                    else:
+                        parsed = recognize_image_gated(
+                            backend, f, model_fn, self.threshold,
+                            force_model=self.force_model, text=ocr_text,
+                        )
                 else:
                     parsed = _rec_fail("该文件类型在当前模式下不支持识别")
                 parsed["elapsed"] = round(time.perf_counter() - _t0, 3)
@@ -293,8 +304,8 @@ class RecognitionWorker(QThread):
             if status == "success":
                 recognized += 1
                 if parsed.get("kind") == "invoice":
-                    # 发票：独立模板（日期-金额元-销售方-类别.pdf）
-                    new_name = render_invoice_name(parsed, self.invoice_category)
+                    # 发票：独立模板（日期-金额元-销售方-类别.原扩展名）
+                    new_name = render_invoice_name(parsed, self.invoice_category, ext)
                 elif self.prefix_date and parsed.get("order_time"):
                     # 时间 + 平台 + 价格（用户勾选「时间前缀」时）
                     new_name = f"{parsed['order_time']}{parsed['platform']}{parsed['amount']}{ext}"
@@ -305,7 +316,7 @@ class RecognitionWorker(QThread):
             else:
                 failed += 1
                 new_name = ""
-            self.row_done.emit(i, parsed, new_name)
+            self.row_done.emit(str(f), parsed, new_name)  # 用路径身份，避免重排/重识别时下标漂移
         self.finished.emit(recognized, failed)
 
     def _postprocess(self, parsed_list: list, excel_data: dict | None):
@@ -364,19 +375,17 @@ class RecognitionWorker(QThread):
             except Exception:
                 pass
 
-        # 3. 淘宝：商品名匹配 Excel；若匹配不到，按价格兜底
+        # 3. 淘宝图片：价格精确匹配为主 + 商品名软确认（与发票分支统一）
+        #     先按金额在 Excel 找对应行，避免「同名不同价」订单被错配金额。
+        #     match_invoice 已为无容差（2 位小数精确相等）、价格为主、品名软确认。
         if excel_data is not None:
-            from order_excel import match_by_price, match_by_product
+            from order_excel import match_invoice
             for p in parsed_list:
-                if p.get("platform") != "淘宝":
+                if p.get("platform") != "淘宝" or p.get("kind") == "invoice":
                     continue
+                orig_amt = p.get("amount")
                 pn = p.get("product_name")
-                row, amb = match_by_product(excel_data, pn)
-                reason = "商品名"
-                if row is None:
-                    # 商品名匹配失败（视觉模型提取的商品名可能与 Excel 差异大），按价格兜底
-                    row, amb = match_by_price(excel_data, p.get("amount"))
-                    reason = "价格"
+                row, amb, _detail = match_invoice(excel_data, orig_amt, pn)
                 if row is not None:
                     p["order_time"] = row["order_time"]   # 时间来自 Excel 订单提交时间
                     if row["price"] is not None:
@@ -385,10 +394,42 @@ class RecognitionWorker(QThread):
                         p["product_name"] = row["product"]  # Excel 商品名更完整，直接覆盖
                     if amb:
                         self.warn.emit(
-                            f"淘宝按{reason}在Excel中匹配到多行，已取最相似行（可能不准）"
+                            f"淘宝图片按价格(¥{orig_amt})在Excel中匹配到多行，"
+                            f"已取最相似行（可能不准，请核对）"
                         )
                 else:
-                    self.warn.emit(f"淘宝图片未在Excel中找到对应订单（商品名：{pn}）")
+                    self.warn.emit(
+                        f"淘宝图片未在Excel中按价格(¥{orig_amt})匹配到订单（商品名：{pn}）"
+                    )
+
+            # 3b. 淘宝发票：价格为主 + 商品名软确认，命中则改写为下单时间 / 淘宝平台
+            #     （与图片分支并列，复用同一「订单数据.xlsx」；发票 platform 是销售方，
+            #      不靠 platform=="淘宝" 判定，而是直接按价格+名称在 Excel 中找对应行）
+            for p in parsed_list:
+                if p.get("kind") != "invoice":
+                    continue
+                row, amb, detail = match_invoice(
+                    excel_data, p.get("amount"), p.get("product"))
+                if row is None:
+                    self.warn.emit(
+                        f"发票(金额¥{p.get('amount')})未在「订单数据.xlsx」中匹配到，"
+                        f"保持原开票日期（可能不是淘宝订单，或金额/品名对不上）"
+                    )
+                    continue
+                p["order_time"] = row["order_time"]   # 消费日期 = Excel 下单时间
+                p["date"] = row["order_time"]         # 表格显示 / 重命名文件名同步为下单时间
+                p["platform"] = "淘宝平台"            # 事由 → "淘宝平台购买…"
+                if row["price"] is not None:
+                    p["amount"] = row["price"]         # 金额对齐 Excel 实付金额
+                if row["product"]:
+                    p["product_name"] = row["product"]
+                    p["product"] = row["product"]        # 表格「商品名称」列也显示 Excel 名
+                p["taobao_matched"] = True
+                if amb:
+                    self.warn.emit(
+                        f"发票按价格在Excel中匹配到多行({detail})，已取最相似行"
+                        f"（可能不准，请核对）"
+                    )
 
         # 4. 名称/日期补填后重新判定状态（四要素复查）：
         #    淘宝等图片的商品名/日期可能在 _postprocess（Excel 匹配）才补齐；
@@ -416,8 +457,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("报销截图智能重命名")
         self.resize(980, 640)
         self.folder_path: str | None = None
-        self.files: list = []           # 当前文件夹图片路径列表（供识别/重命名用）
-        self.results: list = []         # 与 files 对齐：每行 parsed dict 或 None
+        self.entries: list = []         # 单一真源：每行 {"path":Path,"parsed":dict|None,"new_name":str}
+                                       # 文件与识别结果物理绑定，下标无法再错位
+        self._rerun_rows: set = set()  # 本次重识别涉及的全局行号（按路径回填后收集）
         self.last_renames: list = []    # 最近一批重命名 [(old_abs, new_abs)]
         self._worker: "RecognitionWorker | None" = None
         self._last_clicked_row = None  # 表格行 toggle 选中用
@@ -613,13 +655,33 @@ class MainWindow(QMainWindow):
             self.load_folder(d)
             self._auto_save("已记住此文件夹并保存")
 
+    # ---------- 文件/结果单一真源（entries）----------
+    # self.files / self.results 仅为派生只读视图，所有写入都落在 self.entries，
+    # 确保「文件」与「它的识别结果」物理绑定，下标永不错位。
+    @property
+    def files(self) -> list:
+        return [e["path"] for e in self.entries]
+
+    @property
+    def results(self) -> list:
+        return [e["parsed"] for e in self.entries]
+
+    def _find_entry(self, path):
+        """按文件路径身份定位 entry（不靠下标）。找不到返回 None。"""
+        p = str(path)
+        for e in self.entries:
+            if str(e["path"]) == p:
+                return e
+        return None
+
     def load_folder(self, path: str) -> int:
         """扫描文件夹内图片(jpg/jpeg/png)，填充表格。返回图片数。"""
         self.folder_path = path
         p = Path(path)
         files = sorted(f for f in p.iterdir() if f.suffix.lower() in SUPPORTED_EXTS)
-        self.files = files
-        self.results = [None] * len(files)
+        self.entries = [
+            {"path": f, "parsed": None, "new_name": ""} for f in files
+        ]
         self.last_renames = []
         # 自动检测同目录下的"订单数据"Excel（截图与Excel同文件夹）
         self.st_tb_excel_path.setText(self._find_order_excel(path))
@@ -634,6 +696,24 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, COL_NEWNAME, QTableWidgetItem(""))
             self.table.setItem(i, COL_STATUS, QTableWidgetItem("待识别"))
             self._add_rerun_button(i)
+
+        # 尝试恢复上次识别结果（按文件名匹配），免重识别即可导出
+        sess = self._load_session(path)
+        restored = 0
+        if sess:
+            for i, f in enumerate(self.files):
+                entry = sess.get(Path(f).name)
+                if entry:
+                    self.entries[i]["parsed"] = entry
+                    self._on_row_done(str(f), entry, self._make_new_name(i, entry))
+                    restored += 1
+            if restored:
+                self._refresh_kpi_counts()
+                self.status_label.setText(
+                    f"已恢复上次识别结果 {restored} 项，可直接导出"
+                    f"（如需刷新请点「开始识别」）"
+                )
+
         self._persist_last_folder(path)
         return len(files)
 
@@ -645,6 +725,55 @@ class MainWindow(QMainWindow):
             save_config(cfg)
         except Exception:  # noqa: BLE001
             pass  # 配置读写失败不应阻断正常流程
+
+    # ---------- 会话快照（识别结果持久化，重开免重识别）----------
+    def _session_dir(self) -> "Path":
+        log_dir = Path(self.set_logpath.text().strip() or str(DEFAULT_LOG_DIR))
+        d = log_dir / "sessions"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _session_path(self, folder: str) -> "Path":
+        fid = hashlib.md5(folder.encode("utf-8")).hexdigest()[:12]
+        return self._session_dir() / f"session_{fid}.json"
+
+    def _save_session(self):
+        """把当前 self.results 按文件名落盘；重开同文件夹可免重识别。
+
+        键用「当前文件名」：重命名后 self.files 已是新名，故改名后的快照
+        在重开时仍能用新名匹配磁盘文件。任何异常静默忽略。
+        """
+        if not self.folder_path or not self.files:
+            return
+        try:
+            entries = {}
+            for f, r in zip(self.files, self.results):
+                if r is not None:
+                    entries[Path(f).name] = r
+            if not entries:
+                return
+            data = {
+                "folder": self.folder_path,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "entries": entries,
+            }
+            with open(self._session_path(self.folder_path), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _load_session(self, folder: str) -> dict:
+        """返回 {文件名: parsed}；无快照或文件夹不符则 {}。"""
+        try:
+            p = self._session_path(folder)
+            if not p.exists():
+                return {}
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if data.get("folder") != folder:
+                return {}
+            return data.get("entries", {})
+        except Exception:  # noqa: BLE001
+            return {}
 
     def browse_taobao_excel(self):
         start = (str(Path(self.st_tb_excel_path.text()).parent)
@@ -883,7 +1012,7 @@ class MainWindow(QMainWindow):
 
         params = self._build_recognition_params()
         sub_files = [self.files[r] for r in rows]
-        self._rerun_rowmap = {i: r for i, r in enumerate(rows)}  # 子集idx → 全局行
+        self._rerun_rows = set()  # 本次重识别涉及的全局行号，由 _on_row_done 按路径回填后收集
         # 记录旧状态，完成后重算 KPI（比增量更稳）
         for r in rows:
             self.table.setItem(r, COL_STATUS, QTableWidgetItem("重识别中…"))
@@ -910,12 +1039,9 @@ class MainWindow(QMainWindow):
         self._rerun_worker.finished.connect(self._on_rerun_finished)
         self._rerun_worker.start()
 
-    def _on_rerun_row_done(self, sub_idx, parsed, new_name):
-        """子集行完成 → 映射回全局行号，回填该行结果。"""
-        row = self._rerun_rowmap.get(sub_idx)
-        if row is None:
-            return
-        self._on_row_done(row, parsed, new_name)   # 复用回填逻辑（含状态色标）
+    def _on_rerun_row_done(self, path, parsed, new_name):
+        """重识别子集行完成：直接按路径身份回填（与全量识别同一逻辑）。"""
+        self._on_row_done(path, parsed, new_name, is_rerun=True)
 
     def _on_progress_rerun(self, cur, total):
         if total > 0:
@@ -924,7 +1050,7 @@ class MainWindow(QMainWindow):
 
     def _on_rerun_finished(self, recognized, failed):
         """重识别结束 → 逐行立即重命名成功项 + 重算 KPI + 写日志。"""
-        rows = sorted(self._rerun_rowmap.values())
+        rows = sorted(self._rerun_rows)
         folder = Path(self.folder_path)
         strategy = self.set_conflict.currentText()
         entries = []
@@ -947,6 +1073,7 @@ class MainWindow(QMainWindow):
         self._refresh_kpi_counts()
         self._write_log(folder, entries)
         self._write_ocr_log(self.results)   # 落盘本次 OCR 原文，供后台验证
+        self._save_session()                  # 落盘重识别结果，重开可免重识别
         # 重识别的改名并入撤销栈（追加，不清空整批的）
         self.last_renames = list(getattr(self, "last_renames", [])) + renamed
         self.progress_bar.setValue(self.progress_bar.maximum())
@@ -997,7 +1124,7 @@ class MainWindow(QMainWindow):
             is_noop = src.resolve() == target.resolve()
             if not is_noop:
                 src.replace(target)
-                self.files[i] = target        # 同步路径，供二次重识别复用
+                self.entries[i]["path"] = Path(target)  # 同步路径，供二次重识别复用
                 entry["_old_abs"] = str(src)
                 entry["_new_abs"] = str(target)
             self.table.setItem(i, COL_ORIG, QTableWidgetItem(target.name))
@@ -1065,8 +1192,21 @@ class MainWindow(QMainWindow):
         cur = self.status_label.text()
         self.status_label.setText(f"⚠️ {msg}")
 
-    def _on_row_done(self, row, parsed, new_name):
-        self.results[row] = parsed
+    def _on_row_done(self, path, parsed, new_name, is_rerun: bool = False):
+        """按文件路径身份回填结果（非下标），从架构上杜绝 files/results 错位。
+
+        path：识别线程回传的「文件路径」（身份标识），与 entries 中的 path
+        严格对应；即使表格/文件被重排或两次识别重叠，也绝不会把
+        A 文件的结果写到 B 文件槽里。
+        """
+        e = self._find_entry(path)
+        if e is None:
+            return  # 该路径已不在当前列表（如识别中发生改名），安全跳过
+        e["parsed"] = parsed
+        e["new_name"] = new_name
+        row = self.entries.index(e)
+        if is_rerun:
+            self._rerun_rows.add(row)
         amount = parsed.get("amount")
         status = parsed["status"]
         used_llm = parsed.get("used_llm", False)
@@ -1123,6 +1263,7 @@ class MainWindow(QMainWindow):
         self.kpi_failed.findChild(QLabel, "kpiNum").setText(str(failed))
         self.status_label.setText(f"识别完成：成功 {recognized}，失败 {failed}")
         self._write_ocr_log(self.results)   # 落盘 OCR 原文，供后台验证
+        self._save_session()                  # 落盘识别结果，重开可免重识别
         if self.set_autorename.isChecked() and recognized > 0:
             self.execute_rename()
 
@@ -1146,7 +1287,7 @@ class MainWindow(QMainWindow):
         from recognizer import render_template
         ext = Path(self.files[i]).suffix.lower()
         if parsed.get("kind") == "invoice":
-            return render_invoice_name(parsed, self.set_invoice_category.text())
+            return render_invoice_name(parsed, self.set_invoice_category.text(), ext)
         if self.set_prefix_date.isChecked() and parsed.get("order_time"):
             return f"{parsed['order_time']}{parsed.get('platform', '')}{parsed.get('amount', '')}{ext}"
         return render_template(
@@ -1275,7 +1416,7 @@ class MainWindow(QMainWindow):
                 if not is_noop:
                     src.replace(target)
                     renamed.append((str(src), str(target)))
-                    self.files[i] = target  # 同步路径，供二次重命名/识别复用
+                    self.entries[i]["path"] = Path(target)  # 同步路径，供二次重命名/识别复用
                 self.table.setItem(i, 0, QTableWidgetItem(target.name))
                 if keep_failed:
                     # 金额+平台齐全但缺商品名：文件仍改名，状态保持失败（红色显示）
@@ -1300,6 +1441,7 @@ class MainWindow(QMainWindow):
 
         self._write_log(folder, entries)
         self.last_renames = renamed
+        self._save_session()   # 落盘（含改名后新名），重开仍可导出
         self.status_label.setText(
             f"重命名完成：成功 {done}，失败仍改名 {renamed_fail}，跳过 {skipped}，日志已生成"
         )
@@ -1407,8 +1549,21 @@ class MainWindow(QMainWindow):
                 restored += 1
         self.last_renames = []
         self.status_label.setText(f"已撤销：恢复 {restored} 个文件原名")
+        # 撤销后文件名回退，旧快照（按改名后文件名键）已失效，删除避免误导
+        try:
+            self._session_path(self.folder_path).unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
         if self.folder_path:
             self.load_folder(self.folder_path)
+
+    def closeEvent(self, event):
+        """关闭时落盘当前识别结果，下次打开同文件夹可免重识别。"""
+        try:
+            self._save_session()
+        except Exception:  # noqa: BLE001
+            pass
+        super().closeEvent(event)
 
     # ========== 模型选择页（三方法：OCR+正则 / 文字模型 / 视觉模型）==========
     def _build_model_page(self) -> QWidget:

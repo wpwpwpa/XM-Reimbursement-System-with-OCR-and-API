@@ -110,8 +110,15 @@ def build_reimbursement_rows(results, files) -> list[dict]:
     return rows
 
 
+def _raw_header(h) -> str:
+    """模板表头原样返回（含 [「...」] 标注），用于写入导出文件。"""
+    if h is None:
+        return ""
+    return str(h).strip()
+
+
 def _clean_header(h) -> str:
-    """模板表头形如「金额[「金额值和符号」]，取方括号前的真实列名。"""
+    """模板表头形如「金额[「金额值和符号」]，取方括号前的真实列名（仅用于数据映射 key）。"""
     if h is None:
         return ""
     return str(h).split("[")[0].strip()
@@ -130,10 +137,10 @@ def write_reimbursement_excel(template_path: str, expense_type: str,
     instruction = src["A1"].value     # Row1 说明文字
     sys_id = src["A3"].value          # Row3 系统类型 ID
 
-    # 读模板 Row4 表头（剔除末尾空列）
-    headers = [_clean_header(src.cell(row=4, column=c).value)
-               for c in range(1, src.max_column + 1)]
-    headers = [h for h in headers if h]
+    # 读模板 Row4 表头（保留全部列，包括空列，确保与模板列数一致）
+    raw_headers = [_raw_header(src.cell(row=4, column=c).value)
+                   for c in range(1, src.max_column + 1)]
+    clean_headers = [_clean_header(h) for h in raw_headers]
 
     new_wb = Workbook()
     ws = new_wb.active
@@ -144,17 +151,17 @@ def write_reimbursement_excel(template_path: str, expense_type: str,
     if sys_id is not None:
         ws["A3"] = sys_id             # Row3 系统 ID
 
-    # Row4：表头
-    for c, h in enumerate(headers, start=1):
+    # Row4：表头（原样保留模板表头文字，含 [「...」] 标注）
+    for c, h in enumerate(raw_headers, start=1):
         ws.cell(row=4, column=c, value=h)
 
-    # Row5+：数据（按模板表头顺序映射）
+    # Row5+：数据（按 clean_header 做 key 映射，按原始列位置写入）
     for r_idx, row in enumerate(rows, start=5):
-        for c, h in enumerate(headers, start=1):
-            ws.cell(row=r_idx, column=c, value=row.get(h, ""))
+        for c, clean_h in enumerate(clean_headers, start=1):
+            ws.cell(row=r_idx, column=c, value=row.get(clean_h, ""))
 
     # 列宽（共享 helper，支持 > 26 列）
-    set_col_widths(ws, [22] * len(headers))
+    set_col_widths(ws, [22] * len(raw_headers))
 
     out_path = str(Path(out_path).with_suffix(".xlsx"))
     # 局部屏蔽 openpyxl 的"Workbook contains no default style"提示，

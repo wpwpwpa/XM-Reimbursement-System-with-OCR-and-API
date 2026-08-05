@@ -125,8 +125,8 @@ def recognize_image_gated(backend, image_path, model_fn=None,
     result = parse(text, threshold)          # 正则：金额 + 平台
     result["ocr_text"] = text                 # 透传 OCR 原文，供日志/后台验证
     platform = result.get("platform")
-    # 拼多多/美团/京东 可从文本正则抽时间；淘宝留空待 Excel
-    time_img = extract_order_time(text, platform) if platform in ("拼多多", "美团", "京东") else None
+    # 拼多多/美团/京东 正则抽时间；淘宝仅当 OCR 含「创建时间」时抽取（否则留空待 Excel）
+    time_img = extract_order_time(text, platform) if platform in ("拼多多", "美团", "京东", "淘宝") else None
     # 商品名：正则抽取（所有平台均尝试；模型档下优先模型）
     product = extract_product_name(text, platform)
     if product and _is_bad_product(product):   # 质检：垃圾值视为空

@@ -34,3 +34,6 @@ xref-*.html
 *.dll
 *.pyd
 build_backup_*/
+
+# 打包产物备份
+dist_backup/

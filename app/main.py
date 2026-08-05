@@ -387,7 +387,9 @@ class RecognitionWorker(QThread):
                 pn = p.get("product_name")
                 row, amb, _detail = match_invoice(excel_data, orig_amt, pn)
                 if row is not None:
-                    p["order_time"] = row["order_time"]   # 时间来自 Excel 订单提交时间
+                    # 时间优先用 OCR 抽到的「创建时间」；仅当 OCR 无时间才用 Excel 订单提交时间
+                    if not p.get("order_time"):
+                        p["order_time"] = row["order_time"]
                     if row["price"] is not None:
                         p["amount"] = row["price"]        # 价格用 Excel 实付金额
                     if row["product"]:

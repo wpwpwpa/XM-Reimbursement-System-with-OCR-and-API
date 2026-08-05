@@ -2,7 +2,8 @@
 
 - 拼多多：时间取「下单时间」后日期；商品名取「商品名称」后文本
 - 美团：时间取「期望时间」后日期；商品名取「商品」类标签后文本
-- 淘宝：时间与商品名均来自订单 Excel（不在本模块处理，返回 None）
+- 淘宝：截图详情页若含「创建时间」（或「订单创建时间」）则从 OCR 抽下单时间；
+  商品名仍优先来自订单 Excel。无创建时间则本模块返回 None，留待后期 Excel 匹配。
 
 时间统一归一化为 yyyy-MM-dd（Excel 原生日期 / 多种文本写法均兼容）。
 """
@@ -17,6 +18,9 @@ TIME_KEYWORD = {
     "拼多多": ["下单时间"],
     "美团": ["下单时间", "支付时间", "期望时间"],
     "京东": ["支付时间", "下单时间"],
+    # 淘宝：截图详情页常含「创建时间」（也覆盖「订单创建时间」子串）；
+    # 有则作为下单时间，无则留空待订单 Excel 匹配（旧逻辑不变）。
+    "淘宝": ["创建时间"],
 }
 
 # 商品名标签（按优先级）；命中其一即取其后文本。
@@ -32,9 +36,20 @@ BAD_PRODUCT_NAMES = {
     "去购买", "去支付", "支付", "确认收货", "申请退款", "退款", "评价",
     "晒单", "分享", "收藏", "店铺", "进店", "关注", "更多", "展开", "收起",
     "全部", "订单", "订单详情", "暂无", "暂无数据", "加载中", "优惠", "优惠详情",
+    "再买一单", "再买", "去评价", "追评", "晒图",
     # 已知误命中店铺名（整串）
     "菜来了", "小橙阿姨", "绿氧森林园艺店",
 }
+
+
+def _fix_month(mo: int) -> int | None:
+    """纠正 OCR 把月份误读为 13-19 的常见错误：前缀「1」多为噪点
+    （『18月』→『8月』、『13月』→『3月』）。返回合法月份或 None（无法纠正）。"""
+    if 1 <= mo <= 12:
+        return mo
+    if 13 <= mo <= 19:
+        return mo % 10
+    return None
 
 
 def normalize_date(raw) -> str | None:
@@ -43,29 +58,41 @@ def normalize_date(raw) -> str | None:
     支持格式：
     - 4位年：2026-07-05 / 2026.7.5 / 2026/07/05 / 2026年7月5日
     - 无年（补当年份）：6月29日 / 06月13日（美团/拼多多常见）
+    - 相对日期：「今天」→ 当天日期（美团外卖当日订单常见）
+    - 非法月份纠正：OCR 误读『18月』→『8月』等情形自动修正
     """
     if raw is None:
         return None
     if hasattr(raw, "strftime"):  # datetime / date 对象（Excel 原生日期）
         return raw.strftime("%Y-%m-%d")
     s = str(raw).strip()
+
+    # 「今天」→ 当天日期（美团外卖当日订单显示「今天 HH:MM」）
+    if "今天" in s:
+        from datetime import date as _date
+        return _date.today().strftime("%Y-%m-%d")
+
     m = _DATE_RE.search(s)
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        try:
-            return f"{y:04d}-{mo:02d}-{d:02d}"
-        except Exception:
-            pass
+        mo = _fix_month(mo)
+        if mo is not None and 1 <= d <= 31:
+            try:
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+            except Exception:
+                pass
     # 无年格式：M月D日 → 补当年份
     m2 = _DATE_SHORT_RE.search(s)
     if m2:
         from datetime import date as _date
         mo, d = int(m2.group(1)), int(m2.group(2))
+        mo = _fix_month(mo)
         y = _date.today().year
-        try:
-            return f"{y:04d}-{mo:02d}-{d:02d}"
-        except Exception:
-            pass
+        if mo is not None and 1 <= d <= 31:
+            try:
+                return f"{y:04d}-{mo:02d}-{d:02d}"
+            except Exception:
+                pass
     return None
 
 
@@ -78,7 +105,10 @@ def _find_after_keyword(text: str, keyword: str, window: int = 40) -> str:
 
 
 def extract_order_time(text: str, platform: str | None) -> str | None:
-    """按平台取下单/支付/期望时间，归一化为 yyyy-MM-dd。淘宝返回 None。"""
+    """按平台取下单/支付/期望/创建时间，归一化为 yyyy-MM-dd。
+
+    淘宝：仅当截图 OCR 含「创建时间」时返回该日期，否则 None（留给订单 Excel）。
+    """
     if not platform or platform not in TIME_KEYWORD:
         return None
     for keyword in TIME_KEYWORD[platform]:
@@ -124,6 +154,12 @@ def _is_bad_product(name: str) -> bool:
     if len(name) <= 1:
         return True
     if name in BAD_PRODUCT_NAMES:
+        return True
+    # 订单状态行（订单已完成/已取消/已关闭/订单信息…）绝不可能是商品名
+    if name.startswith("订单"):
+        return True
+    # 会员/粉丝徽章（★11粉丝 等）：以 ★ 开头的角标不是商品
+    if name.startswith("★"):
         return True
     # 标签尾巴（短标签「商品」切「商品名称」行会露出「名称」等），绝非零散商品名
     if name in ("名称", "信息", "标题"):
@@ -219,6 +255,14 @@ def _find_anchor_crossline(lines, *keywords):
 
 
 def _extract_below_taobao_shop(lines) -> str | None:
+    """淘宝商品名：先按严格店铺行规则扫，无果再放宽（个体小店/进店按钮）兜底。"""
+    strict = _scan_below_taobao_shop(lines, loose=False)
+    if strict:
+        return strict
+    return _scan_below_taobao_shop(lines, loose=True)
+
+
+def _scan_below_taobao_shop(lines, loose: bool = False) -> str | None:
     """淘宝/天猫专用：找到店铺行，取其后紧邻的商品名行。
 
     淘宝/天猫 OCR 结构固定：店铺行（含淘宝/天猫/旗舰店/专营店，或以「企」开头，
@@ -236,8 +280,13 @@ def _extract_below_taobao_shop(lines) -> str | None:
     )
     shop_keywords = ("淘宝", "天猫", "旗舰店", "专营店", "专卖店")
     for i, ln in enumerate(lines):
-        # 匹配店铺行：含店铺关键词 / 以「企」开头（淘宝企业店） / 以〉>结尾
+        # 匹配店铺行：含店铺关键词 / 以「店」结尾（个体小店，如「晚拧精品生鲜店」）
+        # / 含「进店」按钮（淘宝店铺卡片固定含「进店逛逛」）/ 以「企」开头 / 以〉>结尾
         is_shop = any(k in ln for k in shop_keywords)
+        if loose and not is_shop:
+            # 放宽兜底（仅严格规则无果时启用）：个体小店名，如「晚拧精品生鲜店」
+            if len(ln) >= 4 and ln.rstrip("》>〉 ").endswith("店"):
+                is_shop = True
         if not is_shop and ln.startswith("企"):
             # 以「企」开头 → 淘宝企业店店铺名（与 detect_platform 的「企」特征词对齐）
             is_shop = True
@@ -255,10 +304,14 @@ def _extract_below_taobao_shop(lines) -> str | None:
             # 价格行：若商品名与￥混在同一行，提取￥前文本
             if ("￥" in candidate or "¥" in candidate) and re.search(r"[￥¥]\s*\d", candidate):
                 before_price = re.split(r"[￥¥]", candidate)[0].strip()
-                before_price = _strip_spec(before_price)
+                before_price = _strip_spec(before_price).rstrip("·•・.。，、 √✓>》")
                 if before_price and len(before_price) >= 4 and not _is_bad_product(before_price):
                     return before_price
                 break
+            if loose:
+                # 放宽模式只信任「商品名￥价格」同行结构，纯文本行可能是
+                # 店铺标语/好评摘要（如「实老生用品」），一律跳过
+                continue
             if _line_is_noise(candidate):
                 continue
             # 过滤明显的非商品行
@@ -345,6 +398,45 @@ def _extract_by_price_anchor(lines, platform):
     return name if name and not _is_bad_product(name) else None
 
 
+def _extract_meituan_products(lines) -> str | None:
+    """美团多商品订单：收集每个「实付￥X」小计行上方的商品名，去重后『+』拼接。
+
+    美团一单常含多个商品，每个商品结构为：商品名行（常带「规格」后缀）→ 实付￥X
+    → 规格/数量行。以各「实付￥X」（排除「实付款」总计行）为锚点，向上回溯取商品行，
+    商品名行若带「规格」后缀则从「规格」处截断（保留标题内重量如 300g）；多商品拼接
+    为『A+B+C』。单商品订单返回单名（与原逻辑一致，重量不剥）。
+    """
+    anchors = [i for i, ln in enumerate(lines)
+               if "实付" in ln and "￥" in ln and "实付款" not in ln]
+    products = []
+    for ai in anchors:
+        # 向上回溯至多 6 行，取首个有效商品名（跳过规格/数量/价格/状态噪声）
+        for j in range(ai - 1, max(-1, ai - 7), -1):
+            cand = lines[j].strip()
+            if not cand:
+                continue
+            if _line_is_noise(cand):
+                # 商品名行常带「规格…」后缀被当噪声：从「规格」处截断取前半
+                cut = re.split(r"规格", cand)[0].strip()
+                if not cut or _is_bad_product(cut) or not _looks_like_product(cut):
+                    continue
+                cand = cut
+            if _is_bad_product(cand) or not _looks_like_product(cand):
+                continue
+            # 仅剔除行尾装饰符（· 等），保留标题内重量/规格（如 300g）
+            cand = cand.rstrip("·•・.。，、 ")
+            if cand and not _is_bad_product(cand):
+                products.append(cand)
+            break
+    # 去重保序
+    seen, uniq = set(), []
+    for p in products:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return "+".join(uniq) if uniq else None
+
+
 def _extract_jd_product(lines) -> str | None:
     """京东专用：以「到手」或首个带货币符号的价格行为锚点，向上取首个商品行。
 
@@ -419,6 +511,12 @@ def extract_product_name(text: str, platform: str | None) -> str | None:
         by_jd = _extract_jd_product(lines)
         if by_jd:
             return by_jd
+
+    # 1.7) 美团：多商品订单拼接（单商品退化为单名，与原逻辑一致）
+    if platform == "美团":
+        by_mt = _extract_meituan_products(lines)
+        if by_mt:
+            return by_mt
 
     # 2) 金额锚点兜底
     by_anchor = _extract_by_price_anchor(lines, platform)
